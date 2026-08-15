@@ -1,10 +1,10 @@
 use sqlx::SqlitePool;
 
-/// Initialize the database connection pool and run migrations
+/// 初始化数据库连接池并运行迁移
 pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     let pool = SqlitePool::connect(database_url).await?;
 
-    // Enable WAL mode for better concurrent read performance
+    // 启用 WAL 模式以获得更好的并发读取性能
     sqlx::query("PRAGMA journal_mode=WAL;")
         .execute(&pool)
         .await?;
@@ -12,7 +12,7 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
         .execute(&pool)
         .await?;
 
-    // Run migrations
+    // 运行迁移
     run_migrations(&pool).await?;
 
     Ok(pool)
@@ -69,7 +69,7 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
-    // Add thumb_path column for existing databases (ignore error if already exists)
+    // 为已有数据库添加 thumb_path 列（如果已存在则忽略错误）
     sqlx::query("ALTER TABLE files ADD COLUMN thumb_path TEXT")
         .execute(pool)
         .await
@@ -92,6 +92,62 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
-    tracing::info!("Database migrations completed successfully");
+    // === 新增列迁移（向后兼容，已存在则忽略） ===
+
+    // 用户角色（user / admin）
+    sqlx::query("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+        .execute(pool)
+        .await
+        .ok();
+
+    // 文件软删除
+    sqlx::query("ALTER TABLE files ADD COLUMN deleted_at DATETIME")
+        .execute(pool)
+        .await
+        .ok();
+
+    // 文件夹软删除
+    sqlx::query("ALTER TABLE folders ADD COLUMN deleted_at DATETIME")
+        .execute(pool)
+        .await
+        .ok();
+
+    // 分享：文件夹分享支持
+    sqlx::query("ALTER TABLE file_shares ADD COLUMN folder_id INTEGER REFERENCES folders(id) ON DELETE CASCADE")
+        .execute(pool)
+        .await
+        .ok();
+
+    // 分享：最大下载次数限制
+    sqlx::query("ALTER TABLE file_shares ADD COLUMN max_downloads INTEGER")
+        .execute(pool)
+        .await
+        .ok();
+
+    // 分享：自定义分享码
+    sqlx::query("ALTER TABLE file_shares ADD COLUMN custom_code TEXT")
+        .execute(pool)
+        .await
+        .ok();
+
+    // 为文件搜索添加索引
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_owner ON files(owner_id)")
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_folder ON files(folder_id)")
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_deleted ON files(deleted_at)")
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_folders_deleted ON folders(deleted_at)")
+        .execute(pool)
+        .await
+        .ok();
+
+    tracing::info!("数据库迁移完成");
     Ok(())
 }

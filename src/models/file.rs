@@ -15,9 +15,10 @@ pub struct File {
     pub file_type: String,
     pub uploaded_at: String,
     pub updated_at: String,
+    pub deleted_at: Option<String>,
 }
 
-/// File info with formatted size
+/// 文件信息，包含格式化后的文件大小
 #[derive(Debug, Serialize)]
 pub struct FileInfo {
     pub id: i64,
@@ -35,6 +36,7 @@ pub struct FileInfo {
     pub thumb_url: Option<String>,
     pub download_url: String,
     pub media_url: String,
+    pub deleted_at: Option<String>,
 }
 
 impl File {
@@ -56,7 +58,7 @@ impl File {
         let thumb_url = if self.thumb_path.is_some() {
             Some(format!("/api/files/{}/media?thumb=1", self.id))
         } else if preview_url.is_some() {
-            // Fallback to preview_url for old files without thumbnails
+            // 对于没有缩略图的旧文件，回退到 preview_url
             preview_url.clone()
         } else if image_formats.contains(&ft.as_str()) {
             Some(format!("/api/files/{}/media", self.id))
@@ -80,6 +82,7 @@ impl File {
             thumb_url,
             download_url: format!("/api/files/{}/download", self.id),
             media_url: format!("/api/files/{}/media", self.id),
+            deleted_at: self.deleted_at.clone(),
         }
     }
 }

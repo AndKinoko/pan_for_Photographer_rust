@@ -21,7 +21,7 @@ pub struct LoginRequest {
     pub password: String,
 }
 
-/// POST /api/auth/register
+/// POST /api/auth/register 注册
 pub async fn register(
     State(pool): State<SqlitePool>,
     State(config): State<Config>,
@@ -63,7 +63,7 @@ pub async fn register(
     }
 }
 
-/// POST /api/auth/login
+/// POST /api/auth/login 登录
 pub async fn login(
     State(pool): State<SqlitePool>,
     State(config): State<Config>,
@@ -92,7 +92,7 @@ pub async fn login(
     })))
 }
 
-/// GET /api/auth/me
+/// GET /api/auth/me 获取当前用户信息
 pub async fn me(
     State(pool): State<SqlitePool>,
     auth: AuthUser,

@@ -6,23 +6,23 @@ use crate::config::Config;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
-    pub sub: i64,       // user id
+    pub sub: i64,       // 用户ID
     pub username: String,
-    pub exp: usize,     // expiry timestamp
-    pub iat: usize,     // issued at timestamp
+    pub exp: usize,     // 过期时间戳
+    pub iat: usize,     // 签发时间戳
 }
 
-/// Hash a password using bcrypt
+/// 使用bcrypt对密码进行哈希
 pub fn hash_password(password: &str) -> Result<String, bcrypt::BcryptError> {
     hash(password, DEFAULT_COST)
 }
 
-/// Verify a password against a bcrypt hash
+/// 验证密码与bcrypt哈希是否匹配
 pub fn verify_password(password: &str, hash: &str) -> Result<bool, bcrypt::BcryptError> {
     verify(password, hash)
 }
 
-/// Generate a JWT token for a user
+/// 为用户生成JWT令牌
 pub fn generate_token(user_id: i64, username: &str, config: &Config) -> Result<String, jsonwebtoken::errors::Error> {
     let now = chrono::Utc::now();
     let claims = Claims {
@@ -39,7 +39,7 @@ pub fn generate_token(user_id: i64, username: &str, config: &Config) -> Result<S
     )
 }
 
-/// Validate and decode a JWT token
+/// 验证并解码JWT令牌
 pub fn validate_token(token: &str, config: &Config) -> Result<Claims, jsonwebtoken::errors::Error> {
     decode::<Claims>(
         token,

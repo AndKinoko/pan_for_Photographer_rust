@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// Request for batch move/copy operations
+/// 批量移动/复制操作的请求
 #[derive(Debug, Deserialize)]
 pub struct BatchMoveCopyRequest {
     pub file_ids: Vec<i64>,
@@ -14,14 +14,14 @@ fn default_conflict_strategy() -> String {
     "rename".to_string()
 }
 
-/// Request for batch delete
+/// 批量删除的请求
 #[derive(Debug, Deserialize)]
 pub struct BatchDeleteRequest {
     pub file_ids: Vec<i64>,
     pub folder_ids: Vec<i64>,
 }
 
-/// Single item result in a batch operation
+/// 批处理操作中的单个项目结果
 #[derive(Debug, Serialize)]
 pub struct BatchItemResult {
     pub id: i64,
@@ -37,7 +37,7 @@ pub struct BatchItemResult {
     pub children_count: Option<i64>,
 }
 
-/// Summary for batch move/copy result
+/// 批量移动/复制结果的摘要
 #[derive(Debug, Serialize)]
 pub struct BatchMoveCopyResult {
     pub total: usize,
@@ -47,7 +47,7 @@ pub struct BatchMoveCopyResult {
     pub results: Vec<BatchItemResult>,
 }
 
-/// Summary for batch delete result
+/// 批量删除结果的摘要
 #[derive(Debug, Serialize)]
 pub struct BatchDeleteResult {
     pub total: usize,
@@ -56,7 +56,7 @@ pub struct BatchDeleteResult {
     pub results: Vec<BatchItemResult>,
 }
 
-/// Request for batch share
+/// 批量分享的请求
 #[derive(Debug, Deserialize)]
 pub struct BatchShareRequest {
     pub file_ids: Vec<i64>,
@@ -64,7 +64,7 @@ pub struct BatchShareRequest {
     pub password: Option<String>,
 }
 
-/// Single share result
+/// 单个分享结果
 #[derive(Debug, Serialize)]
 pub struct ShareItemResult {
     pub file_id: i64,
@@ -76,7 +76,7 @@ pub struct ShareItemResult {
     pub status: String,
 }
 
-/// Summary for batch share result
+/// 批量分享结果的摘要
 #[derive(Debug, Serialize)]
 pub struct BatchShareResult {
     pub total: usize,
@@ -85,13 +85,13 @@ pub struct BatchShareResult {
     pub shares: Vec<ShareItemResult>,
 }
 
-/// Request for batch unshare
+/// 批量取消分享的请求
 #[derive(Debug, Deserialize)]
 pub struct BatchUnshareRequest {
     pub file_ids: Vec<i64>,
 }
 
-/// Single unshare result
+/// 单个取消分享结果
 #[derive(Debug, Serialize)]
 pub struct UnshareItemResult {
     pub file_id: i64,
@@ -101,7 +101,7 @@ pub struct UnshareItemResult {
     pub status: String,
 }
 
-/// Summary for batch unshare result
+/// 批量取消分享结果的摘要
 #[derive(Debug, Serialize)]
 pub struct BatchUnshareResult {
     pub total: usize,

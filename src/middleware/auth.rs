@@ -9,7 +9,7 @@ use serde_json::json;
 use crate::config::Config;
 use crate::utils::crypto::validate_token;
 
-/// Extracted authenticated user info
+/// 提取的已验证用户信息
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub user_id: i64,
@@ -17,7 +17,7 @@ pub struct AuthUser {
     pub username: String,
 }
 
-/// Axum extractor that validates JWT from Authorization header
+/// 从 Authorization 头验证 JWT 的 Axum 提取器
 #[async_trait]
 impl<S> FromRequestParts<S> for AuthUser
 where

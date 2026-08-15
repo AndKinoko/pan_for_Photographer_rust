@@ -8,14 +8,16 @@ pub struct User {
     #[serde(skip_serializing)]
     pub password_hash: String,
     pub created_at: String,
+    pub role: String,
 }
 
-/// Public user info (no password)
+/// 公开用户信息（不含密码）
 #[derive(Debug, Serialize)]
 pub struct UserInfo {
     pub id: i64,
     pub username: String,
     pub created_at: String,
+    pub role: String,
 }
 
 impl From<User> for UserInfo {
@@ -24,6 +26,7 @@ impl From<User> for UserInfo {
             id: u.id,
             username: u.username,
             created_at: u.created_at,
+            role: u.role,
         }
     }
 }

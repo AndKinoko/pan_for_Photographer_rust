@@ -5,15 +5,15 @@ use image::GenericImageView;
 
 use crate::errors::AppError;
 
-/// Max dimensions for large preview (used in preview box)
+/// 大预览的最大尺寸（用于预览框）
 const PREVIEW_MAX_W: u32 = 1616;
 const PREVIEW_MAX_H: u32 = 1080;
 
-/// Max dimensions for small thumbnail (used in file list icons)
+/// 小缩略图的最大尺寸（用于文件列表图标）
 const THUMB_MAX_W: u32 = 360;
 const THUMB_MAX_H: u32 = 240;
 
-/// Calculate resize dimensions maintaining aspect ratio, capped at max_w x max_h
+/// 计算保持宽高比的缩放尺寸，上限为 max_w x max_h
 fn calc_resize_dims(width: u32, height: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     let w_ratio = max_w as f64 / width as f64;
     let h_ratio = max_h as f64 / height as f64;
@@ -25,7 +25,7 @@ fn calc_resize_dims(width: u32, height: u32, max_w: u32, max_h: u32) -> (u32, u3
     }
 }
 
-/// Resize an image to fit within max dimensions, save as JPEG
+/// 将图像缩放到适合最大尺寸，保存为JPEG格式
 fn resize_and_save(
     img: &image::DynamicImage,
     preview_path: &Path,
@@ -40,7 +40,7 @@ fn resize_and_save(
     Ok((new_w, new_h))
 }
 
-/// Generate a full-size preview image (max 1616×1080) for the preview box
+/// 生成全尺寸预览图像（最大1616×1080）用于预览框
 pub async fn generate_preview(
     file_path: &Path,
     preview_path: &Path,
@@ -49,7 +49,7 @@ pub async fn generate_preview(
     generate_resized(file_path, preview_path, file_type, PREVIEW_MAX_W, PREVIEW_MAX_H, "preview").await
 }
 
-/// Generate a small thumbnail (max 360×240) for file list icons
+/// 生成小缩略图（最大360×240）用于文件列表图标
 pub async fn generate_thumbnail(
     file_path: &Path,
     thumb_path: &Path,
@@ -58,7 +58,7 @@ pub async fn generate_thumbnail(
     generate_resized(file_path, thumb_path, file_type, THUMB_MAX_W, THUMB_MAX_H, "thumbnail").await
 }
 
-/// Core generation logic: open image, resize to fit max_w×max_h, save as JPEG
+/// 核心生成逻辑：打开图像，缩放到适合 max_w×max_h，保存为JPEG格式
 async fn generate_resized(
     file_path: &Path,
     output_path: &Path,
@@ -117,20 +117,20 @@ async fn generate_resized(
     Ok(())
 }
 
-/// Quickly read JPEG image dimensions from raw bytes without full decoding.
-/// Scans for SOF (Start of Frame) markers: FF C0 (baseline) or FF C2 (progressive).
-/// Returns (width, height) or None if dimensions cannot be read.
+/// 从原始字节快速读取JPEG图像尺寸，无需完全解码。
+/// 扫描SOF（帧开始）标记：FF C0（基线）或 FF C2（渐进式）。
+/// 返回 (width, height) 或如果无法读取则返回 None。
 fn read_jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     if data.len() < 10 {
         return None;
     }
-    let mut i = 2; // skip SOI marker (FF D8)
+    let mut i = 2; // 跳过SOI标记（FF D8）
     while i < data.len().saturating_sub(8) {
         if data[i] == 0xFF {
             let marker = data[i + 1];
-            // SOF markers: C0-C3, C5-C7, C9-CB, CD-CF (all Start of Frame variants)
+            // SOF标记：C0-C3, C5-C7, C9-CB, CD-CF（所有帧开始变体）
             if matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF) {
-                // Marker structure: FF XX, length (2 bytes BE), precision (1), height (2), width (2)
+                // 标记结构：FF XX, 长度（2字节大端）, 精度（1）, 高度（2）, 宽度（2）
                 if i + 9 < data.len() {
                     let height = u16::from_be_bytes([data[i + 5], data[i + 6]]) as u32;
                     let width = u16::from_be_bytes([data[i + 7], data[i + 8]]) as u32;
@@ -138,21 +138,21 @@ fn read_jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
                         return Some((width, height));
                     }
                 }
-                return None; // SOF found but can't parse, stop
+                return None; // 找到SOF但无法解析，停止
             }
-            // Skip marker: FF 00 is escaped, FF D0-D7 are RST markers (no data)
+            // 跳过标记：FF 00 是转义，FF D0-D7 是RST标记（无数据）
             if marker == 0x00 || (0xD0..=0xD7).contains(&marker) {
                 i += 2;
                 continue;
             }
-            // SOS marker (FF DA) — start of scan, no more metadata after this
+            // SOS标记（FF DA）—— 扫描开始，之后不再有元数据
             if marker == 0xDA {
                 return None;
             }
-            // Other markers: read length and skip
+            // 其他标记：读取长度并跳过
             if i + 3 < data.len() {
                 let seg_len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
-                i += seg_len + 2; // +2 for the FF XX marker bytes
+                i += seg_len + 2; // +2 表示 FF XX 标记字节
             } else {
                 i += 2;
             }
@@ -163,12 +163,11 @@ fn read_jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
-/// Try to extract an embedded JPEG preview from a RAW file.
+/// 尝试从RAW文件中提取嵌入的JPEG预览。
 ///
-/// Many RAW formats (especially Sony ARW) contain multiple embedded JPEGs:
-/// a small thumbnail first, then a larger preview. This function scans for
-/// ALL JPEG segments, picks the largest one by pixel area, and resizes to
-/// fit within max_w x max_h.
+/// 许多RAW格式（尤其是索尼ARW）包含多个嵌入的JPEG：
+/// 先是一个小缩略图，然后是一个更大的预览。此函数扫描所有JPEG段，
+/// 按像素面积选取最大的一个，并缩放到适合 max_w x max_h 的尺寸。
 async fn extract_embedded_jpeg(
     file_path: &Path,
     preview_path: &Path,
@@ -179,13 +178,13 @@ async fn extract_embedded_jpeg(
     let data = tokio::fs::read(file_path).await?;
     let file_size = data.len();
 
-    // Scan for all JPEG SOI markers (FF D8 FF) and record their offsets + dimensions
+    // 扫描所有JPEG SOI标记（FF D8 FF）并记录其偏移量和尺寸
     let mut candidates: Vec<(usize, u32, u32)> = Vec::new();
     let mut i = 0;
     while i < data.len().saturating_sub(4) {
         if data[i] == 0xFF && data[i + 1] == 0xD8 && data[i + 2] == 0xFF {
-            // Validate that the byte after SOI is a valid JPEG marker
-            // Valid markers: 0xC0-0xCF (except 0xC4/0xC8/0xCC reserved), 0xDB-0xDF, 0xE0-0xEF, 0xFE
+            // 验证SOI后的字节是有效的JPEG标记
+            // 有效标记：0xC0-0xCF（保留的0xC4/0xC8/0xCC除外），0xDB-0xDF，0xE0-0xEF，0xFE
             let next_byte = data[i + 3];
             let is_valid_marker = matches!(next_byte,
                 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF |
@@ -198,7 +197,7 @@ async fn extract_embedded_jpeg(
                 continue;
             }
 
-            // Found a valid JPEG SOI marker — try to read dimensions
+            // 找到有效的JPEG SOI标记——尝试读取尺寸
             let jpeg_slice = &data[i..];
             if let Some((w, h)) = read_jpeg_dimensions(jpeg_slice) {
                 candidates.push((i, w, h));
@@ -210,7 +209,7 @@ async fn extract_embedded_jpeg(
                     h
                 );
             }
-            // Skip invalid candidates (dimensions unreadable) to avoid false positives
+            // 跳过无效的候选（尺寸不可读）以避免误报
         }
         i += 1;
     }
@@ -220,16 +219,16 @@ async fn extract_embedded_jpeg(
         return Err(AppError::Internal("无法生成RAW文件预览".into()));
     }
 
-    // Pick the candidate with the largest pixel area
+    // 选取像素面积最大的候选
     let best = candidates
         .iter()
         .max_by_key(|(_, w, h)| (*w as u64) * (*h as u64))
-        .unwrap();
+        .ok_or_else(|| AppError::Internal("无法生成RAW文件预览".into()))?;
 
-    let (offset, orig_w, orig_h) = *best;
+    let &(offset, orig_w, orig_h) = best;
     let jpeg_data = &data[offset..];
 
-    // Find the EOI marker to trim trailing data
+    // 找到EOI标记以裁剪尾部数据
     let mut end = jpeg_data.len();
     for i in (0..jpeg_data.len().saturating_sub(2)).rev() {
         if jpeg_data[i] == 0xFF && jpeg_data[i + 1] == 0xD9 {
@@ -240,7 +239,7 @@ async fn extract_embedded_jpeg(
 
     tokio::fs::write(preview_path, &jpeg_data[..end]).await?;
 
-    // Resize using the provided max dimensions
+    // 使用提供的最大尺寸进行缩放
     if let Ok(img) = image::open(preview_path) {
         let (width, height) = img.dimensions();
         let (new_w, new_h) = calc_resize_dims(width, height, max_w, max_h);

@@ -9,11 +9,11 @@ pub struct Folder {
     pub parent_id: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
+    pub deleted_at: Option<String>,
 }
 
-/// Folder info with file/folder counts
+/// 文件夹信息，包含文件/子文件夹数量
 #[derive(Debug, Serialize)]
-#[allow(dead_code)]
 pub struct FolderInfo {
     pub id: i64,
     pub name: String,
@@ -23,4 +23,5 @@ pub struct FolderInfo {
     pub updated_at: String,
     pub file_count: i64,
     pub subfolder_count: i64,
+    pub deleted_at: Option<String>,
 }

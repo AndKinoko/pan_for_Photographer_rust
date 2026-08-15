@@ -12,7 +12,7 @@ use crate::services::batch_service;
 use crate::services::share_service;
 use sqlx::SqlitePool;
 
-/// POST /api/batch/move
+/// POST /api/batch/move 批量移动
 pub async fn batch_move(
     State(pool): State<SqlitePool>,
     State(config): State<Config>,
@@ -27,7 +27,7 @@ pub async fn batch_move(
     })))
 }
 
-/// POST /api/batch/copy
+/// POST /api/batch/copy 批量复制
 pub async fn batch_copy(
     State(pool): State<SqlitePool>,
     State(config): State<Config>,
@@ -42,7 +42,7 @@ pub async fn batch_copy(
     })))
 }
 
-/// POST /api/batch/delete
+/// POST /api/batch/delete 批量删除
 pub async fn batch_delete(
     State(pool): State<SqlitePool>,
     State(config): State<Config>,
@@ -57,7 +57,7 @@ pub async fn batch_delete(
     })))
 }
 
-/// POST /api/batch/share
+/// POST /api/batch/share 批量分享
 pub async fn batch_share(
     State(pool): State<SqlitePool>,
     auth: AuthUser,
@@ -113,10 +113,13 @@ pub async fn batch_share(
 
         match share_service::create_share(
             &pool,
-            file_id,
+            Some(file_id),
+            None,
             auth.user_id,
             req.expires_hours,
             req.password.clone(),
+            None,
+            None,
         )
         .await
         {
@@ -155,7 +158,7 @@ pub async fn batch_share(
     })))
 }
 
-/// POST /api/batch/unshare
+/// POST /api/batch/unshare 批量取消分享
 pub async fn batch_unshare(
     State(pool): State<SqlitePool>,
     auth: AuthUser,
@@ -194,7 +197,7 @@ pub async fn batch_unshare(
                 });
             }
             None => {
-                // Get file name for the result
+                // 获取文件名用于结果输出
                 let file_name: String = sqlx::query_scalar(
                     "SELECT original_name FROM files WHERE id = ?",
                 )

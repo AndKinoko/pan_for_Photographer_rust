@@ -5,7 +5,7 @@ use axum::{
 };
 use serde_json::json;
 
-/// Unified application error type
+/// 统一的应用错误类型
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum AppError {
@@ -59,13 +59,13 @@ impl IntoResponse for AppError {
     }
 }
 
-// Convert common errors into AppError
+// 将常见错误转换为 AppError
 impl From<sqlx::Error> for AppError {
     fn from(e: sqlx::Error) -> Self {
         match e {
             sqlx::Error::RowNotFound => AppError::NotFound("资源不存在".into()),
             _ => {
-                tracing::error!("Database error: {:?}", e);
+                tracing::error!("数据库错误：{:?}", e);
                 AppError::Internal("数据库操作失败".into())
             }
         }
@@ -74,42 +74,42 @@ impl From<sqlx::Error> for AppError {
 
 impl From<bcrypt::BcryptError> for AppError {
     fn from(e: bcrypt::BcryptError) -> Self {
-        tracing::error!("Bcrypt error: {:?}", e);
+        tracing::error!("Bcrypt 错误：{:?}", e);
         AppError::Internal("密码处理失败".into())
     }
 }
 
 impl From<image::ImageError> for AppError {
     fn from(e: image::ImageError) -> Self {
-        tracing::error!("Image processing error: {:?}", e);
+        tracing::error!("图片处理错误：{:?}", e);
         AppError::Internal("图片处理失败".into())
     }
 }
 
 impl From<std::io::Error> for AppError {
     fn from(e: std::io::Error) -> Self {
-        tracing::error!("IO error: {:?}", e);
+        tracing::error!("IO 错误：{:?}", e);
         AppError::Internal("文件操作失败".into())
     }
 }
 
 impl From<serde_json::Error> for AppError {
     fn from(e: serde_json::Error) -> Self {
-        tracing::error!("JSON error: {:?}", e);
+        tracing::error!("JSON 错误：{:?}", e);
         AppError::BadRequest("请求数据格式错误".into())
     }
 }
 
 impl From<axum::extract::multipart::MultipartError> for AppError {
     fn from(e: axum::extract::multipart::MultipartError) -> Self {
-        tracing::error!("Multipart error: {:?}", e);
+        tracing::error!("Multipart 错误：{:?}", e);
         AppError::BadRequest("文件上传数据格式错误".into())
     }
 }
 
 impl From<jsonwebtoken::errors::Error> for AppError {
     fn from(e: jsonwebtoken::errors::Error) -> Self {
-        tracing::error!("JWT error: {:?}", e);
+        tracing::error!("JWT 错误：{:?}", e);
         AppError::Unauthorized("认证失败".into())
     }
 }

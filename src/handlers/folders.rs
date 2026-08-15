@@ -19,7 +19,12 @@ pub struct CreateFolderRequest {
     pub parent_id: Option<i64>,
 }
 
-/// GET /api/folders?parent_id={id}
+#[derive(Debug, Deserialize)]
+pub struct RenameRequest {
+    pub name: String,
+}
+
+/// GET /api/folders?parent_id={id} 获取文件夹列表
 pub async fn list_folders(
     State(pool): State<SqlitePool>,
     auth: AuthUser,
@@ -27,7 +32,7 @@ pub async fn list_folders(
 ) -> Result<Json<Value>, AppError> {
     let folders = folder_service::list_folders(&pool, auth.user_id, query.parent_id).await?;
 
-    // Get breadcrumbs if parent_id is specified
+    // 如果指定了父文件夹 ID，则获取面包屑导航
     let breadcrumbs = if let Some(pid) = query.parent_id {
         folder_service::get_breadcrumbs(&pool, pid).await.unwrap_or_default()
     } else {
@@ -44,7 +49,7 @@ pub async fn list_folders(
     })))
 }
 
-/// POST /api/folders
+/// POST /api/folders 创建文件夹
 pub async fn create_folder(
     State(pool): State<SqlitePool>,
     auth: AuthUser,
@@ -69,14 +74,57 @@ pub async fn create_folder(
     })))
 }
 
-/// DELETE /api/folders/:id
+/// DELETE /api/folders/:id 删除文件夹（软删除，移入回收站）
 pub async fn delete_folder(
+    State(pool): State<SqlitePool>,
+    auth: AuthUser,
+    Path(folder_id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    folder_service::soft_delete_folder(&pool, folder_id, auth.user_id).await?;
+    Ok(Json(json!({
+        "success": true,
+        "data": null,
+        "error": null
+    })))
+}
+
+/// PUT /api/folders/:id/rename 重命名文件夹
+pub async fn rename_folder(
+    State(pool): State<SqlitePool>,
+    auth: AuthUser,
+    Path(folder_id): Path<i64>,
+    Json(req): Json<RenameRequest>,
+) -> Result<Json<Value>, AppError> {
+    let folder = folder_service::rename_folder(&pool, folder_id, auth.user_id, &req.name).await?;
+    Ok(Json(json!({
+        "success": true,
+        "data": folder,
+        "error": null
+    })))
+}
+
+/// POST /api/folders/:id/restore 从回收站恢复文件夹
+pub async fn restore_folder(
+    State(pool): State<SqlitePool>,
+    auth: AuthUser,
+    Path(folder_id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    folder_service::restore_folder(&pool, folder_id, auth.user_id).await?;
+    Ok(Json(json!({
+        "success": true,
+        "data": null,
+        "error": null
+    })))
+}
+
+/// DELETE /api/folders/:id/permanent 永久删除文件夹（从回收站）
+pub async fn permanent_delete_folder(
     State(pool): State<SqlitePool>,
     State(config): State<Config>,
     auth: AuthUser,
     Path(folder_id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
-    folder_service::delete_folder(&pool, &config, folder_id, auth.user_id).await?;
+    folder_service::permanently_delete_folder(&pool, &config, folder_id, auth.user_id).await?;
     Ok(Json(json!({
         "success": true,
         "data": null,

@@ -6,7 +6,8 @@ use crate::models::folder::Folder;
 use crate::services::file_service;
 use sqlx::SqlitePool;
 
-/// List folders for a user (optionally filtered by parent)
+/// 列出用户的文件夹（可选按父文件夹过滤）
+/// 自动过滤已软删除的文件夹
 pub async fn list_folders(
     pool: &SqlitePool,
     owner_id: i64,
@@ -14,7 +15,7 @@ pub async fn list_folders(
 ) -> Result<Vec<Folder>, AppError> {
     let folders = if let Some(pid) = parent_id {
         sqlx::query_as::<_, Folder>(
-            "SELECT * FROM folders WHERE owner_id = ? AND parent_id = ? ORDER BY name",
+            "SELECT * FROM folders WHERE owner_id = ? AND parent_id = ? AND deleted_at IS NULL ORDER BY name",
         )
         .bind(owner_id)
         .bind(pid)
@@ -22,7 +23,7 @@ pub async fn list_folders(
         .await?
     } else {
         sqlx::query_as::<_, Folder>(
-            "SELECT * FROM folders WHERE owner_id = ? AND parent_id IS NULL ORDER BY name",
+            "SELECT * FROM folders WHERE owner_id = ? AND parent_id IS NULL AND deleted_at IS NULL ORDER BY name",
         )
         .bind(owner_id)
         .fetch_all(pool)
@@ -32,14 +33,308 @@ pub async fn list_folders(
     Ok(folders)
 }
 
-/// Create a new folder
+/// 重命名文件夹
+pub async fn rename_folder(
+    pool: &SqlitePool,
+    folder_id: i64,
+    owner_id: i64,
+    new_name: &str,
+) -> Result<Folder, AppError> {
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        return Err(AppError::BadRequest("文件夹名称不能为空".into()));
+    }
+
+    // 获取文件夹并验证所有权
+    let folder = sqlx::query_as::<_, Folder>(
+        "SELECT * FROM folders WHERE id = ? AND owner_id = ? AND deleted_at IS NULL",
+    )
+    .bind(folder_id)
+    .bind(owner_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("文件夹不存在".into()))?;
+
+    // 检查同名文件夹（排除自身）
+    let existing = if let Some(pid) = folder.parent_id {
+        sqlx::query_as::<_, Folder>(
+            "SELECT * FROM folders WHERE name = ? AND owner_id = ? AND parent_id = ? AND id != ? AND deleted_at IS NULL",
+        )
+        .bind(new_name)
+        .bind(owner_id)
+        .bind(pid)
+        .bind(folder_id)
+        .fetch_optional(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, Folder>(
+            "SELECT * FROM folders WHERE name = ? AND owner_id = ? AND parent_id IS NULL AND id != ? AND deleted_at IS NULL",
+        )
+        .bind(new_name)
+        .bind(owner_id)
+        .bind(folder_id)
+        .fetch_optional(pool)
+        .await?
+    };
+
+    if existing.is_some() {
+        return Err(AppError::Conflict("同名文件夹已存在".into()));
+    }
+
+    let updated = sqlx::query_as::<_, Folder>(
+        "UPDATE folders SET name = ?, updated_at = datetime('now') WHERE id = ? AND owner_id = ? RETURNING *",
+    )
+    .bind(new_name)
+    .bind(folder_id)
+    .bind(owner_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(updated)
+}
+
+/// 软删除文件夹（移入回收站）
+/// 递归软删除所有子文件夹和子文件
+pub async fn soft_delete_folder(
+    pool: &SqlitePool,
+    folder_id: i64,
+    owner_id: i64,
+) -> Result<(), AppError> {
+    // 验证文件夹属于当前用户
+    let folder = sqlx::query_as::<_, Folder>(
+        "SELECT * FROM folders WHERE id = ? AND owner_id = ? AND deleted_at IS NULL",
+    )
+    .bind(folder_id)
+    .bind(owner_id)
+    .fetch_optional(pool)
+    .await?;
+
+    if folder.is_none() {
+        return Err(AppError::NotFound("文件夹不存在".into()));
+    }
+
+    // 使用BFS收集所有子文件夹ID
+    let mut folder_ids = vec![folder_id];
+    let mut queue: VecDeque<i64> = VecDeque::new();
+    queue.push_back(folder_id);
+
+    while let Some(current_id) = queue.pop_front() {
+        let subfolders: Vec<(i64,)> = sqlx::query_as(
+            "SELECT id FROM folders WHERE parent_id = ? AND deleted_at IS NULL",
+        )
+        .bind(current_id)
+        .fetch_all(pool)
+        .await?;
+
+        for (sub_id,) in subfolders {
+            folder_ids.push(sub_id);
+            queue.push_back(sub_id);
+        }
+    }
+
+    // 软删除所有子文件夹中的文件
+    for fid in &folder_ids {
+        sqlx::query("UPDATE files SET deleted_at = datetime('now') WHERE folder_id = ? AND deleted_at IS NULL")
+            .bind(fid)
+            .execute(pool)
+            .await?;
+    }
+
+    // 软删除所有收集到的文件夹
+    for fid in &folder_ids {
+        sqlx::query("UPDATE folders SET deleted_at = datetime('now') WHERE id = ? AND deleted_at IS NULL")
+            .bind(fid)
+            .execute(pool)
+            .await?;
+    }
+
+    tracing::info!("文件夹已移入回收站: id={}, 含 {} 个子文件夹", folder_id, folder_ids.len());
+    Ok(())
+}
+
+/// 从回收站恢复文件夹
+pub async fn restore_folder(
+    pool: &SqlitePool,
+    folder_id: i64,
+    owner_id: i64,
+) -> Result<(), AppError> {
+    // 验证文件夹在回收站中
+    let folder = sqlx::query_as::<_, Folder>(
+        "SELECT * FROM folders WHERE id = ? AND owner_id = ? AND deleted_at IS NOT NULL",
+    )
+    .bind(folder_id)
+    .bind(owner_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("文件夹不在回收站中".into()))?;
+
+    // 检查父文件夹是否也被删除了
+    let restore_to_root = if let Some(pid) = folder.parent_id {
+        let parent_exists: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM folders WHERE id = ? AND owner_id = ? AND deleted_at IS NULL",
+        )
+        .bind(pid)
+        .bind(owner_id)
+        .fetch_optional(pool)
+        .await?;
+
+        parent_exists.is_none()
+    } else {
+        false
+    };
+
+    // 使用BFS收集所有子文件夹ID（包括已删除的）
+    let mut folder_ids = vec![folder_id];
+    let mut queue: VecDeque<i64> = VecDeque::new();
+    queue.push_back(folder_id);
+
+    while let Some(current_id) = queue.pop_front() {
+        let subfolders: Vec<(i64,)> = sqlx::query_as(
+            "SELECT id FROM folders WHERE parent_id = ? AND deleted_at IS NOT NULL",
+        )
+        .bind(current_id)
+        .fetch_all(pool)
+        .await?;
+
+        for (sub_id,) in subfolders {
+            folder_ids.push(sub_id);
+            queue.push_back(sub_id);
+        }
+    }
+
+    // 恢复所有文件夹
+    for fid in &folder_ids {
+        sqlx::query("UPDATE folders SET deleted_at = NULL WHERE id = ?")
+            .bind(fid)
+            .execute(pool)
+            .await?;
+    }
+
+    // 恢复所有文件夹中的文件
+    for fid in &folder_ids {
+        sqlx::query("UPDATE files SET deleted_at = NULL WHERE folder_id = ?")
+            .bind(fid)
+            .execute(pool)
+            .await?;
+    }
+
+    // 如果父文件夹被删除了，将文件夹移到根目录
+    if restore_to_root {
+        sqlx::query("UPDATE folders SET parent_id = NULL WHERE id = ?")
+            .bind(folder_id)
+            .execute(pool)
+            .await?;
+    }
+
+    tracing::info!("文件夹已从回收站恢复: id={}", folder_id);
+    Ok(())
+}
+
+/// 列出回收站中的文件夹
+pub async fn list_trash_folders(
+    pool: &SqlitePool,
+    owner_id: i64,
+) -> Result<Vec<Folder>, AppError> {
+    let folders = sqlx::query_as::<_, Folder>(
+        "SELECT * FROM folders WHERE owner_id = ? AND deleted_at IS NOT NULL ORDER BY deleted_at DESC",
+    )
+    .bind(owner_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(folders)
+}
+
+/// 永久删除回收站中的文件夹（及其子文件夹和文件）
+pub async fn permanently_delete_folder(
+    pool: &SqlitePool,
+    config: &Config,
+    folder_id: i64,
+    owner_id: i64,
+) -> Result<(), AppError> {
+    // 验证文件夹属于当前用户
+    let folder = sqlx::query_as::<_, Folder>(
+        "SELECT * FROM folders WHERE id = ? AND owner_id = ?",
+    )
+    .bind(folder_id)
+    .bind(owner_id)
+    .fetch_optional(pool)
+    .await?;
+
+    if folder.is_none() {
+        return Err(AppError::NotFound("文件夹不存在".into()));
+    }
+
+    // 使用BFS收集所有子文件夹ID
+    let mut folder_ids = vec![folder_id];
+    let mut queue: VecDeque<i64> = VecDeque::new();
+    queue.push_back(folder_id);
+
+    while let Some(current_id) = queue.pop_front() {
+        let subfolders: Vec<(i64,)> = sqlx::query_as(
+            "SELECT id FROM folders WHERE parent_id = ? AND owner_id = ?",
+        )
+        .bind(current_id)
+        .bind(owner_id)
+        .fetch_all(pool)
+        .await?;
+
+        for (sub_id,) in subfolders {
+            folder_ids.push(sub_id);
+            queue.push_back(sub_id);
+        }
+    }
+
+    // 删除所有文件夹中的文件（物理+数据库）
+    for fid in &folder_ids {
+        let files: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, stored_path, preview_path, thumb_path FROM files WHERE folder_id = ?",
+        )
+        .bind(fid)
+        .fetch_all(pool)
+        .await?;
+
+        for (file_id, stored_path, preview_path, thumb_path) in files {
+            let stored_full = config.upload_dir.join(&stored_path);
+            match file_service::delete_physical_file_with_retry(&stored_full, "源文件").await {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::warn!("Source file cleanup failed (non-fatal): {} - {}", stored_full.display(), e.message());
+                }
+            }
+            if let Some(ref pp) = preview_path {
+                file_service::cleanup_preview_file(config, pp).await;
+            }
+            if let Some(ref tp) = thumb_path {
+                file_service::cleanup_preview_file(config, tp).await;
+            }
+            sqlx::query("DELETE FROM files WHERE id = ?")
+                .bind(file_id)
+                .execute(pool)
+                .await?;
+        }
+    }
+
+    // 删除文件夹记录
+    for fid in folder_ids.iter().rev() {
+        sqlx::query("DELETE FROM folders WHERE id = ?")
+            .bind(fid)
+            .execute(pool)
+            .await?;
+    }
+
+    tracing::info!("文件夹已永久删除: id={}", folder_id);
+    Ok(())
+}
+
+/// 创建新文件夹
 pub async fn create_folder(
     pool: &SqlitePool,
     owner_id: i64,
     name: &str,
     parent_id: Option<i64>,
 ) -> Result<Folder, AppError> {
-    // Validate parent belongs to user if specified
+    // 如果指定了父文件夹，验证其属于当前用户
     if let Some(pid) = parent_id {
         let parent = sqlx::query_as::<_, Folder>(
             "SELECT * FROM folders WHERE id = ? AND owner_id = ?",
@@ -54,10 +349,10 @@ pub async fn create_folder(
         }
     }
 
-    // Check for duplicate name
+    // 检查是否存在同名文件夹（排除已删除的）
     let existing = if let Some(pid) = parent_id {
         sqlx::query_as::<_, Folder>(
-            "SELECT * FROM folders WHERE name = ? AND owner_id = ? AND parent_id = ?",
+            "SELECT * FROM folders WHERE name = ? AND owner_id = ? AND parent_id = ? AND deleted_at IS NULL",
         )
         .bind(name)
         .bind(owner_id)
@@ -66,7 +361,7 @@ pub async fn create_folder(
         .await?
     } else {
         sqlx::query_as::<_, Folder>(
-            "SELECT * FROM folders WHERE name = ? AND owner_id = ? AND parent_id IS NULL",
+            "SELECT * FROM folders WHERE name = ? AND owner_id = ? AND parent_id IS NULL AND deleted_at IS NULL",
         )
         .bind(name)
         .bind(owner_id)
@@ -90,16 +385,16 @@ pub async fn create_folder(
     Ok(folder)
 }
 
-/// Delete a folder and all its contents recursively using iterative BFS
+/// 使用迭代BFS递归删除文件夹及其所有内容
 pub async fn delete_folder(
     pool: &SqlitePool,
     config: &Config,
     folder_id: i64,
     owner_id: i64,
 ) -> Result<(), AppError> {
-    // Verify folder belongs to user
+    // 验证文件夹属于当前用户
     let folder = sqlx::query_as::<_, Folder>(
-        "SELECT * FROM folders WHERE id = ? AND owner_id = ?",
+        "SELECT * FROM folders WHERE id = ? AND owner_id = ? AND deleted_at IS NULL",
     )
     .bind(folder_id)
     .bind(owner_id)
@@ -110,14 +405,14 @@ pub async fn delete_folder(
         return Err(AppError::NotFound("文件夹不存在".into()));
     }
 
-    // Collect all subfolder IDs using iterative BFS
+    // 使用迭代BFS收集所有子文件夹ID（未删除的）
     let mut folder_ids = vec![folder_id];
     let mut queue: VecDeque<i64> = VecDeque::new();
     queue.push_back(folder_id);
 
     while let Some(current_id) = queue.pop_front() {
         let subfolders: Vec<(i64,)> = sqlx::query_as(
-            "SELECT id FROM folders WHERE parent_id = ?",
+            "SELECT id FROM folders WHERE parent_id = ? AND deleted_at IS NULL",
         )
         .bind(current_id)
         .fetch_all(pool)
@@ -129,7 +424,7 @@ pub async fn delete_folder(
         }
     }
 
-    // Delete all files in all collected folders with retry and logging
+    // 删除所有收集到的文件夹中的文件，带重试和日志
     for fid in &folder_ids {
         let files: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT id, stored_path, preview_path, thumb_path FROM files WHERE folder_id = ?",
@@ -147,7 +442,7 @@ pub async fn delete_folder(
 
         for (file_id, stored_path, preview_path, thumb_path) in files {
             let stored_full = config.upload_dir.join(&stored_path);
-            // Use retry-based deletion for source files
+            // 使用基于重试的删除方式处理源文件
             match file_service::delete_physical_file_with_retry(&stored_full, "源文件").await {
                 Ok(()) => {}
                 Err(e) => {
@@ -167,7 +462,7 @@ pub async fn delete_folder(
                 file_service::cleanup_preview_file(config, tp).await;
             }
 
-            // Delete DB record
+            // 删除数据库记录
             sqlx::query("DELETE FROM files WHERE id = ?")
                 .bind(file_id)
                 .execute(pool)
@@ -175,9 +470,9 @@ pub async fn delete_folder(
         }
     }
 
-    // Delete folders in reverse order (children first) via cascading or manual
-    // SQLite foreign keys with ON DELETE CASCADE should handle this,
-    // but we delete explicitly for safety
+    // 以反向顺序删除文件夹（子文件夹优先）
+    // SQLite 外键的 ON DELETE CASCADE 本应处理此逻辑，
+    // 但为安全起见，我们显式删除
     for fid in folder_ids.iter().rev() {
         sqlx::query("DELETE FROM folders WHERE id = ?")
             .bind(fid)
@@ -188,7 +483,7 @@ pub async fn delete_folder(
     Ok(())
 }
 
-/// Get breadcrumb path for a folder
+/// 获取文件夹的面包屑导航路径
 pub async fn get_breadcrumbs(
     pool: &SqlitePool,
     folder_id: i64,
@@ -197,7 +492,7 @@ pub async fn get_breadcrumbs(
     let mut current_id = Some(folder_id);
 
     while let Some(cid) = current_id {
-        let folder = sqlx::query_as::<_, Folder>("SELECT * FROM folders WHERE id = ?")
+        let folder = sqlx::query_as::<_, Folder>("SELECT * FROM folders WHERE id = ? AND deleted_at IS NULL")
             .bind(cid)
             .fetch_optional(pool)
             .await?;
