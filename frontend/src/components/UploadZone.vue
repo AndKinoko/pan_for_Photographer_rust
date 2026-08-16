@@ -38,6 +38,7 @@ function onPick(e) {
   e.target.value = ''
 }
 function onDrop(e) {
+  e.stopPropagation()
   dragOver.value = false
   addFiles(e.dataTransfer?.files)
 }
