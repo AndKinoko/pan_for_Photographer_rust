@@ -310,14 +310,14 @@ onBeforeUnmount(() => document.removeEventListener('click', onDocClick))
 }
 .menu button {
   text-align: left;
-  padding: 9px 12px;
+  padding: 1px 1px;
   border-radius: 6px;
   font-size: 0.86rem;
   color: var(--text-heading);
   display: flex;
   align-items: center;
   gap: 8px;
-  min-height: 38px;
+  min-height: 30px;
 }
 .menu button:hover {
   background: var(--bg-hover);
