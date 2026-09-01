@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, onUnmounted } from 'vue'
 import http, { formatSize } from '../api'
 import { useToast } from '../composables/useToast'
 
@@ -16,6 +16,34 @@ const dragOver = ref(false)
 const inputEl = ref(null)
 const queue = ref([]) // { id, name, size, status, progress, error }
 let seq = 0
+let activeController = null // 当前进行中上传的 AbortController
+let unmounted = false // 组件已卸载，禁止继续启动上传
+
+// 组件卸载时中止进行中的上传，避免静默占用网络与后端连接
+onUnmounted(() => {
+  unmounted = true
+  activeController?.abort()
+})
+
+/** 失败自动重试：网络错误/5xx 退避重试（最多 2 次重试），4xx、超时与主动取消直接落败。 */
+async function withRetry(fn, attempts = 3) {
+  let lastErr
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fn()
+    } catch (err) {
+      lastErr = err
+      const status = err?.status
+      const timedOut = err?.code === 'ECONNABORTED'
+      const canceled = err?.code === 'ERR_CANCELED' // 主动 abort，不重试
+      // 可重试：无状态码（网络中断）或 5xx；不重试 4xx、超时与取消
+      const retriable = !canceled && (status ? status >= 500 : !timedOut)
+      if (i === attempts || !retriable) throw err
+      await new Promise((resolve) => setTimeout(resolve, 400 * i))
+    }
+  }
+  throw lastErr
+}
 
 const hasActive = computed(() =>
   queue.value.some((q) => q.status === 'uploading' || q.status === 'pending')
@@ -65,13 +93,19 @@ async function uploadOne(item) {
     form.append('folder_id', String(props.folderId))
   }
   form.append('file', item._file, item.name)
+  const controller = new AbortController()
+  activeController = controller
   try {
-    const data = await http.post('/api/files/upload', form, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-      onUploadProgress: (e) => {
-        if (e.total) item.progress = Math.round((e.loaded / e.total) * 100)
-      },
-    })
+    // 网络错误/5xx 会自动退避重试；4xx 与超时直接落败并继续下一个
+    const data = await withRetry(() =>
+      http.post('/api/files/upload', form, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        signal: controller.signal,
+        onUploadProgress: (e) => {
+          if (e.total) item.progress = Math.round((e.loaded / e.total) * 100)
+        },
+      })
+    )
     // data = { files: [FileInfo], errors: [String], count }
     const errs = data?.errors || []
     if (errs.length && (!data?.files || !data.files.length)) {
@@ -86,15 +120,17 @@ async function uploadOne(item) {
     }
   } catch (err) {
     item.status = 'error'
-    item.error = err.message || '上传失败'
+    item.error = err?.status === 413 ? '文件超过大小限制' : err.message || '上传失败'
     toast.error(`${item.name}: ${item.error}`)
   } finally {
+    activeController = null
     item._file = null
     startNext()
   }
 }
 
 function startNext() {
+  if (unmounted) return // 组件已卸载，不再启动新上传
   const next = queue.value.find((q) => q.status === 'pending')
   if (next) {
     uploadOne(next)

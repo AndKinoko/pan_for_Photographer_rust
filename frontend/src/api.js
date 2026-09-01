@@ -105,27 +105,6 @@ export const listFiles = (folderId) =>
     params: folderId != null ? { folder_id: folderId } : {},
   })
 
-/**
- * Upload files with per-file progress reporting.
- * @param {File[]} files
- * @param {number|null} folderId
- * @param {(loaded:number,total:number,fileIndex:number)=>void} onProgress
- */
-export function uploadFiles(files, folderId, onProgress) {
-  const form = new FormData()
-  if (folderId != null && folderId !== '') {
-    form.append('folder_id', String(folderId))
-  }
-  for (const f of files) form.append('file', f, f.name)
-
-  return instance.post('/api/files/upload', form, {
-    headers: { 'Content-Type': 'multipart/form-data' },
-    onUploadProgress: (e) => {
-      if (onProgress && e.total) onProgress(e.loaded, e.total, 0)
-    },
-  })
-}
-
 export const renameFile = (id, name) =>
   instance.put(`/api/files/${id}/rename`, { name })
 

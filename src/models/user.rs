@@ -9,6 +9,7 @@ pub struct User {
     pub password_hash: String,
     pub created_at: String,
     pub role: String,
+    pub expires_at: Option<String>,
 }
 
 /// 公开用户信息（不含密码）
@@ -18,6 +19,7 @@ pub struct UserInfo {
     pub username: String,
     pub created_at: String,
     pub role: String,
+    pub expires_at: Option<String>,
 }
 
 impl From<User> for UserInfo {
@@ -27,6 +29,7 @@ impl From<User> for UserInfo {
             username: u.username,
             created_at: u.created_at,
             role: u.role,
+            expires_at: u.expires_at,
         }
     }
 }

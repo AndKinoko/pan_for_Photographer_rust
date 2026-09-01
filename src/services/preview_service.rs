@@ -2,7 +2,9 @@ use std::path::Path;
 
 use image::imageops::FilterType;
 use image::GenericImageView;
+use uuid::Uuid;
 
+use crate::config::Config;
 use crate::errors::AppError;
 
 /// 大预览的最大尺寸（用于预览框）
@@ -41,25 +43,25 @@ fn resize_and_save(
 }
 
 /// 生成全尺寸预览图像（最大1616×1080）用于预览框
-pub async fn generate_preview(
+pub fn generate_preview(
     file_path: &Path,
     preview_path: &Path,
     file_type: &str,
 ) -> Result<(), AppError> {
-    generate_resized(file_path, preview_path, file_type, PREVIEW_MAX_W, PREVIEW_MAX_H, "preview").await
+    generate_resized(file_path, preview_path, file_type, PREVIEW_MAX_W, PREVIEW_MAX_H, "preview")
 }
 
 /// 生成小缩略图（最大360×240）用于文件列表图标
-pub async fn generate_thumbnail(
+pub fn generate_thumbnail(
     file_path: &Path,
     thumb_path: &Path,
     file_type: &str,
 ) -> Result<(), AppError> {
-    generate_resized(file_path, thumb_path, file_type, THUMB_MAX_W, THUMB_MAX_H, "thumbnail").await
+    generate_resized(file_path, thumb_path, file_type, THUMB_MAX_W, THUMB_MAX_H, "thumbnail")
 }
 
 /// 核心生成逻辑：打开图像，缩放到适合 max_w×max_h，保存为JPEG格式
-async fn generate_resized(
+fn generate_resized(
     file_path: &Path,
     output_path: &Path,
     file_type: &str,
@@ -74,7 +76,7 @@ async fn generate_resized(
     ];
 
     if let Some(parent) = output_path.parent() {
-        tokio::fs::create_dir_all(parent).await.ok();
+        std::fs::create_dir_all(parent).ok();
     }
 
     if image_formats.contains(&ft.as_str()) {
@@ -107,7 +109,7 @@ async fn generate_resized(
                 );
             }
             Err(_) => {
-                extract_embedded_jpeg(file_path, output_path, max_w, max_h, label).await?;
+                extract_embedded_jpeg(file_path, output_path, max_w, max_h, label)?;
             }
         }
     } else {
@@ -168,14 +170,14 @@ fn read_jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
 /// 许多RAW格式（尤其是索尼ARW）包含多个嵌入的JPEG：
 /// 先是一个小缩略图，然后是一个更大的预览。此函数扫描所有JPEG段，
 /// 按像素面积选取最大的一个，并缩放到适合 max_w x max_h 的尺寸。
-async fn extract_embedded_jpeg(
+fn extract_embedded_jpeg(
     file_path: &Path,
     preview_path: &Path,
     max_w: u32,
     max_h: u32,
     label: &str,
 ) -> Result<(), AppError> {
-    let data = tokio::fs::read(file_path).await?;
+    let data = std::fs::read(file_path)?;
     let file_size = data.len();
 
     // 扫描所有JPEG SOI标记（FF D8 FF）并记录其偏移量和尺寸
@@ -237,7 +239,7 @@ async fn extract_embedded_jpeg(
         }
     }
 
-    tokio::fs::write(preview_path, &jpeg_data[..end]).await?;
+    std::fs::write(preview_path, &jpeg_data[..end])?;
 
     // 使用提供的最大尺寸进行缩放
     if let Ok(img) = image::open(preview_path) {
@@ -261,4 +263,52 @@ async fn extract_embedded_jpeg(
     }
 
     Ok(())
+}
+
+/// 在后台任务（blocking 线程）中为某个已落盘的文件生成预览图与缩略图。
+///
+/// 返回 `(preview_rel, thumb_rel)`，失败对应的项返回 `None`；两者都失败时
+/// 不产出任何文件。调用方应在成功后 UPDATE files 表写入路径。
+pub fn generate_preview_and_thumb(
+    config: &Config,
+    owner_id: i64,
+    file_path: &Path,
+    file_type: &str,
+) -> (Option<String>, Option<String>) {
+    let preview_dir = config
+        .upload_dir
+        .join(format!("user_{}", owner_id))
+        .join("previews");
+    let _ = std::fs::create_dir_all(&preview_dir);
+
+    let preview_name = format!("{}.jpg", Uuid::new_v4().simple());
+    let preview_rel = format!("user_{}/previews/{}", owner_id, preview_name);
+    let thumb_name = format!("{}_thumb.jpg", Uuid::new_v4().simple());
+    let thumb_rel = format!("user_{}/previews/{}", owner_id, thumb_name);
+
+    let preview_full = config.upload_dir.join(&preview_rel);
+    let thumb_full = config.upload_dir.join(&thumb_rel);
+
+    let preview_result = generate_preview(file_path, &preview_full, file_type);
+    let thumb_result = generate_thumbnail(file_path, &thumb_full, file_type);
+
+    match (preview_result, thumb_result) {
+        (Ok(()), Ok(())) => (Some(preview_rel), Some(thumb_rel)),
+        (Ok(()), Err(e)) => {
+            tracing::warn!("Thumbnail generation failed: {:?}", e);
+            let _ = std::fs::remove_file(&thumb_full);
+            (Some(preview_rel), None)
+        }
+        (Err(e), Ok(())) => {
+            tracing::warn!("Preview generation failed: {:?}", e);
+            let _ = std::fs::remove_file(&preview_full);
+            (None, Some(thumb_rel))
+        }
+        (Err(e1), Err(e2)) => {
+            tracing::warn!("Preview generation failed: {:?}, thumbnail: {:?}", e1, e2);
+            let _ = std::fs::remove_file(&preview_full);
+            let _ = std::fs::remove_file(&thumb_full);
+            (None, None)
+        }
+    }
 }

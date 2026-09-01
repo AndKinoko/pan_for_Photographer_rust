@@ -80,6 +80,17 @@ pub async fn login(
         return Err(AppError::Unauthorized("用户名或密码错误".into()));
     }
 
+    // 校验账号有效期：expires_at 已过则拒绝登录（NULL 表示永久有效）
+    if let Some(ref exp) = user.expires_at {
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        if exp.trim() <= now.as_str() {
+            return Err(AppError::Unauthorized(format!(
+                "账号已过期（{}），请联系管理员续期",
+                exp.trim()
+            )));
+        }
+    }
+
     let token = crypto::generate_token(user.id, &user.username, &config)?;
 
     Ok(Json(json!({

@@ -1,6 +1,5 @@
 use std::collections::{HashSet, VecDeque};
 
-use crate::config::Config;
 use crate::errors::AppError;
 use crate::models::batch::*;
 use crate::models::file::File;
@@ -95,7 +94,6 @@ fn generate_unique_name(existing_names: &HashSet<String>, original: &str) -> Str
 /// 批量移动文件和文件夹
 pub async fn batch_move(
     pool: &SqlitePool,
-    config: &Config,
     user_id: i64,
     req: &BatchMoveCopyRequest,
 ) -> Result<BatchMoveCopyResult, AppError> {
@@ -222,7 +220,7 @@ pub async fn batch_move(
                         .await?
                     };
                     if let Some((tid,)) = target_file {
-                        let _ = file_service::delete_file(pool, config, tid, user_id).await;
+                        let _ = file_service::delete_file(pool, tid, user_id).await;
                     }
                     current_names.remove(&original_name);
                 }
@@ -324,7 +322,6 @@ pub async fn batch_move(
 /// 批量复制文件
 pub async fn batch_copy(
     pool: &SqlitePool,
-    config: &Config,
     user_id: i64,
     req: &BatchMoveCopyRequest,
 ) -> Result<BatchMoveCopyResult, AppError> {
@@ -458,7 +455,7 @@ pub async fn batch_copy(
                         .await?
                     };
                     if let Some((tid,)) = target_file {
-                        let _ = file_service::delete_file(pool, config, tid, user_id).await;
+                        let _ = file_service::delete_file(pool, tid, user_id).await;
                     }
                     current_names.remove(&original_name);
                 }
@@ -640,7 +637,6 @@ pub async fn batch_copy(
 /// 批量删除文件和文件夹（软删除，移入回收站）
 pub async fn batch_delete(
     pool: &SqlitePool,
-    _config: &Config,
     user_id: i64,
     req: &BatchDeleteRequest,
 ) -> Result<BatchDeleteResult, AppError> {

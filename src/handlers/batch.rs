@@ -4,7 +4,6 @@ use axum::{
 };
 use serde_json::{json, Value};
 
-use crate::config::Config;
 use crate::errors::AppError;
 use crate::middleware::auth::AuthUser;
 use crate::models::batch::*;
@@ -15,11 +14,10 @@ use sqlx::SqlitePool;
 /// POST /api/batch/move 批量移动
 pub async fn batch_move(
     State(pool): State<SqlitePool>,
-    State(config): State<Config>,
     auth: AuthUser,
     Json(req): Json<BatchMoveCopyRequest>,
 ) -> Result<Json<Value>, AppError> {
-    let result = batch_service::batch_move(&pool, &config, auth.user_id, &req).await?;
+    let result = batch_service::batch_move(&pool, auth.user_id, &req).await?;
     Ok(Json(json!({
         "success": true,
         "data": result,
@@ -30,11 +28,10 @@ pub async fn batch_move(
 /// POST /api/batch/copy 批量复制
 pub async fn batch_copy(
     State(pool): State<SqlitePool>,
-    State(config): State<Config>,
     auth: AuthUser,
     Json(req): Json<BatchMoveCopyRequest>,
 ) -> Result<Json<Value>, AppError> {
-    let result = batch_service::batch_copy(&pool, &config, auth.user_id, &req).await?;
+    let result = batch_service::batch_copy(&pool, auth.user_id, &req).await?;
     Ok(Json(json!({
         "success": true,
         "data": result,
@@ -45,11 +42,10 @@ pub async fn batch_copy(
 /// POST /api/batch/delete 批量删除
 pub async fn batch_delete(
     State(pool): State<SqlitePool>,
-    State(config): State<Config>,
     auth: AuthUser,
     Json(req): Json<BatchDeleteRequest>,
 ) -> Result<Json<Value>, AppError> {
-    let result = batch_service::batch_delete(&pool, &config, auth.user_id, &req).await?;
+    let result = batch_service::batch_delete(&pool, auth.user_id, &req).await?;
     Ok(Json(json!({
         "success": true,
         "data": result,

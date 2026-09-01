@@ -2,7 +2,6 @@ use axum::{extract::{Path, Query, State}, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::config::Config;
 use crate::errors::AppError;
 use crate::middleware::auth::AuthUser;
 use crate::services::folder_service;
@@ -120,11 +119,10 @@ pub async fn restore_folder(
 /// DELETE /api/folders/:id/permanent 永久删除文件夹（从回收站）
 pub async fn permanent_delete_folder(
     State(pool): State<SqlitePool>,
-    State(config): State<Config>,
     auth: AuthUser,
     Path(folder_id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
-    folder_service::permanently_delete_folder(&pool, &config, folder_id, auth.user_id).await?;
+    folder_service::permanently_delete_folder(&pool, folder_id, auth.user_id).await?;
     Ok(Json(json!({
         "success": true,
         "data": null,

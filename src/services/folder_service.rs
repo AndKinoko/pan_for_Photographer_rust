@@ -1,9 +1,7 @@
 use std::collections::VecDeque;
 
-use crate::config::Config;
 use crate::errors::AppError;
 use crate::models::folder::Folder;
-use crate::services::file_service;
 use sqlx::SqlitePool;
 
 /// 列出用户的文件夹（可选按父文件夹过滤）
@@ -246,9 +244,9 @@ pub async fn list_trash_folders(
 }
 
 /// 永久删除回收站中的文件夹（及其子文件夹和文件）
+/// 磁盘清理交由周期 GC（sweeper）统一处理。
 pub async fn permanently_delete_folder(
     pool: &SqlitePool,
-    config: &Config,
     folder_id: i64,
     owner_id: i64,
 ) -> Result<(), AppError> {
@@ -285,34 +283,12 @@ pub async fn permanently_delete_folder(
         }
     }
 
-    // 删除所有文件夹中的文件（物理+数据库）
+    // 删除所有文件夹中的文件记录（物理文件交由 GC 处理）
     for fid in &folder_ids {
-        let files: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT id, stored_path, preview_path, thumb_path FROM files WHERE folder_id = ?",
-        )
-        .bind(fid)
-        .fetch_all(pool)
-        .await?;
-
-        for (file_id, stored_path, preview_path, thumb_path) in files {
-            let stored_full = config.upload_dir.join(&stored_path);
-            match file_service::delete_physical_file_with_retry(&stored_full, "源文件").await {
-                Ok(()) => {}
-                Err(e) => {
-                    tracing::warn!("Source file cleanup failed (non-fatal): {} - {}", stored_full.display(), e.message());
-                }
-            }
-            if let Some(ref pp) = preview_path {
-                file_service::cleanup_preview_file(config, pp).await;
-            }
-            if let Some(ref tp) = thumb_path {
-                file_service::cleanup_preview_file(config, tp).await;
-            }
-            sqlx::query("DELETE FROM files WHERE id = ?")
-                .bind(file_id)
-                .execute(pool)
-                .await?;
-        }
+        sqlx::query("DELETE FROM files WHERE folder_id = ?")
+            .bind(fid)
+            .execute(pool)
+            .await?;
     }
 
     // 删除文件夹记录
@@ -383,104 +359,6 @@ pub async fn create_folder(
     .await?;
 
     Ok(folder)
-}
-
-/// 使用迭代BFS递归删除文件夹及其所有内容
-pub async fn delete_folder(
-    pool: &SqlitePool,
-    config: &Config,
-    folder_id: i64,
-    owner_id: i64,
-) -> Result<(), AppError> {
-    // 验证文件夹属于当前用户
-    let folder = sqlx::query_as::<_, Folder>(
-        "SELECT * FROM folders WHERE id = ? AND owner_id = ? AND deleted_at IS NULL",
-    )
-    .bind(folder_id)
-    .bind(owner_id)
-    .fetch_optional(pool)
-    .await?;
-
-    if folder.is_none() {
-        return Err(AppError::NotFound("文件夹不存在".into()));
-    }
-
-    // 使用迭代BFS收集所有子文件夹ID（未删除的）
-    let mut folder_ids = vec![folder_id];
-    let mut queue: VecDeque<i64> = VecDeque::new();
-    queue.push_back(folder_id);
-
-    while let Some(current_id) = queue.pop_front() {
-        let subfolders: Vec<(i64,)> = sqlx::query_as(
-            "SELECT id FROM folders WHERE parent_id = ? AND deleted_at IS NULL",
-        )
-        .bind(current_id)
-        .fetch_all(pool)
-        .await?;
-
-        for (sub_id,) in subfolders {
-            folder_ids.push(sub_id);
-            queue.push_back(sub_id);
-        }
-    }
-
-    // 删除所有收集到的文件夹中的文件，带重试和日志
-    for fid in &folder_ids {
-        let files: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT id, stored_path, preview_path, thumb_path FROM files WHERE folder_id = ?",
-        )
-        .bind(fid)
-        .fetch_all(pool)
-        .await?;
-
-        let file_count = files.len();
-        tracing::info!(
-            "Deleting {} files from folder id={}",
-            file_count,
-            fid
-        );
-
-        for (file_id, stored_path, preview_path, thumb_path) in files {
-            let stored_full = config.upload_dir.join(&stored_path);
-            // 使用基于重试的删除方式处理源文件
-            match file_service::delete_physical_file_with_retry(&stored_full, "源文件").await {
-                Ok(()) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        "Source file cleanup failed during folder deletion (non-fatal): {} - {}",
-                        stored_full.display(),
-                        e.message()
-                    );
-                }
-            }
-
-            if let Some(ref pp) = preview_path {
-                file_service::cleanup_preview_file(config, pp).await;
-            }
-
-            if let Some(ref tp) = thumb_path {
-                file_service::cleanup_preview_file(config, tp).await;
-            }
-
-            // 删除数据库记录
-            sqlx::query("DELETE FROM files WHERE id = ?")
-                .bind(file_id)
-                .execute(pool)
-                .await?;
-        }
-    }
-
-    // 以反向顺序删除文件夹（子文件夹优先）
-    // SQLite 外键的 ON DELETE CASCADE 本应处理此逻辑，
-    // 但为安全起见，我们显式删除
-    for fid in folder_ids.iter().rev() {
-        sqlx::query("DELETE FROM folders WHERE id = ?")
-            .bind(fid)
-            .execute(pool)
-            .await?;
-    }
-
-    Ok(())
 }
 
 /// 获取文件夹的面包屑导航路径

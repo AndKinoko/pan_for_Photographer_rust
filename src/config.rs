@@ -7,8 +7,10 @@ pub struct Config {
     pub server_port: u16,
     pub database_url: String,
     pub upload_dir: PathBuf,
+    pub static_dir: String,
     pub jwt_secret: Vec<u8>,
     pub max_file_size: u64,
+    pub gc_interval_sec: u64,
 }
 
 impl Config {
@@ -37,6 +39,8 @@ impl Config {
             .into();
         std::fs::create_dir_all(&upload_dir).ok();
 
+        let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "static".into());
+
         // 从文件读取 JWT 密钥；如果缺失则 panic
         let jwt_secret_key_file = std::env::var("JWT_SECRET_KEY_FILE")
             .unwrap_or_else(|_| "./.secret_key".into());
@@ -54,13 +58,20 @@ impl Config {
             .parse()
             .expect("MAX_FILE_SIZE 必须是一个有效的 u64 值");
 
+        let gc_interval_sec: u64 = std::env::var("GC_INTERVAL_SEC")
+            .unwrap_or_else(|_| "600".into())
+            .parse()
+            .expect("GC_INTERVAL_SEC 必须是一个有效的 u64 值");
+
         Config {
             server_host,
             server_port,
             database_url,
             upload_dir,
+            static_dir,
             jwt_secret,
             max_file_size,
+            gc_interval_sec,
         }
     }
 }

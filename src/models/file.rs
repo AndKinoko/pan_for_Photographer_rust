@@ -41,27 +41,20 @@ pub struct FileInfo {
 
 impl File {
     pub fn to_info(&self) -> FileInfo {
-        let image_formats = [
-            "jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "tif",
-        ];
-        let ft = self.file_type.to_lowercase();
-
+        // preview/thumb 未生成（NULL）时返回 None，让前端显示文件图标/占位，
+        // 避免回退到原始大图导致全量下载。后台生成完成后由列表刷新补上。
         let has_preview = self.preview_path.is_some();
         let preview_url = if self.preview_path.is_some() {
             Some(format!("/api/files/{}/media?preview=1", self.id))
-        } else if image_formats.contains(&ft.as_str()) {
-            Some(format!("/api/files/{}/media", self.id))
         } else {
             None
         };
 
         let thumb_url = if self.thumb_path.is_some() {
             Some(format!("/api/files/{}/media?thumb=1", self.id))
-        } else if preview_url.is_some() {
+        } else if let Some(pv) = &preview_url {
             // 对于没有缩略图的旧文件，回退到 preview_url
-            preview_url.clone()
-        } else if image_formats.contains(&ft.as_str()) {
-            Some(format!("/api/files/{}/media", self.id))
+            Some(pv.clone())
         } else {
             None
         };

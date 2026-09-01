@@ -1,15 +1,18 @@
 use axum::{
     body::Body,
     extract::{Multipart, Path, Query, State},
-    http::{header, StatusCode},
+    http::{HeaderMap, header, StatusCode},
     response::Response,
     Json,
 };
+use futures_util::{StreamExt, TryStreamExt};
 use tokio_util::io::ReaderStream;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::Path as StdPath;
+use std::path::{Path as StdPath, PathBuf};
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -17,7 +20,6 @@ use crate::errors::AppError;
 use crate::middleware::auth::AuthUser;
 use crate::models::file::File;
 use crate::services::{file_service, preview_service};
-use crate::services::file_service::supports_preview;
 use sqlx::SqlitePool;
 
 #[derive(Debug, Deserialize)]
@@ -39,25 +41,64 @@ pub async fn list_files(
     })))
 }
 
-/// 在 multipart 解析过程中收集的待处理文件数据
-struct PendingFile {
+/// RAII 守卫：axum 在客户端断开/请求中断时会 drop handler 的 future，
+/// 此处 Drop 会立即清理未提交的临时 .part 文件，避免残留半写文件。
+struct PartialGuard {
+    path: Option<PathBuf>,
+}
+
+impl Drop for PartialGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
+/// multipart 解析过程中已流式写盘的待提交文件（暂存为 .part，提交时 rename）
+struct PendingUpload {
+    guard: PartialGuard, // 持有临时 .part 路径，rename 提交后置 None
+    stored_name: String, // {uuid}.{ext}
     file_name: String,
-    data: Vec<u8>,
+    size: i64,
+    ext: String,
 }
 
 /// POST /api/files/upload 上传文件
+/// 采用 multipart 流式写盘：对每个 file 字段用 bytes_stream() 逐块写入，
+/// 字段内 chunk 计数作为单文件权威限制（max_file_size）；
+/// 请求总 Content-Length 做粗预检（> max_file_size 直接 413）。
 pub async fn upload_files(
     State(pool): State<SqlitePool>,
     State(config): State<Config>,
+    State(sem): State<Arc<Semaphore>>,
     auth: AuthUser,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, AppError> {
+    // 粗预检：全请求 Content-Length 超限立即 413，省得传完才被 Limited 掐断。
+    // 注意这是全请求总量预算；单文件权威限制由字段内 chunk 计数承担。
+    if let Some(cl) = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if cl > config.max_file_size {
+            return Err(AppError::PayloadTooLarge("上传总量超过限制".into()));
+        }
+    }
+
     let mut folder_id: Option<i64> = None;
-    let mut pending_files: Vec<PendingFile> = Vec::new();
+    let mut explicit_user: Option<i64> = None;
+    let mut pending: Vec<PendingUpload> = Vec::new();
     let mut uploaded_files: Vec<Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
-    // 阶段 1：收集所有元数据字段并缓存文件数据
+    // 临时落盘根目录（与 user_* 同一文件系统，rename 原子提交）
+    let temp_root = config.upload_dir.join(".tmp_incoming");
+    tokio::fs::create_dir_all(&temp_root).await?;
+
+    // 阶段 1：收集元数据字段；对 file 字段连续流式写盘到 .part，不整体缓冲
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
 
@@ -66,119 +107,145 @@ pub async fn upload_files(
             if !text.is_empty() {
                 folder_id = text.parse::<i64>().ok();
             }
+        } else if name == "user_id" {
+            let text = field.text().await.unwrap_or_default();
+            if !text.is_empty() {
+                explicit_user = text.parse::<i64>().ok();
+            }
         } else if name == "file" {
             let file_name = field.file_name().unwrap_or("unknown").to_string();
             if file_name.is_empty() {
                 continue;
             }
 
-            let data = field.bytes().await.map_err(|_| {
-                AppError::BadRequest("读取文件数据失败".into())
-            })?;
+            // 扩展名校验：廉价且前置，避免为不合法类型写盘
+            if let Err(e) = file_service::validate_extension(&file_name) {
+                errors.push(e.message().to_string());
+                continue;
+            }
 
-            pending_files.push(PendingFile { file_name, data: data.to_vec() });
+            let tmp_path = temp_root.join(format!("{}.part", Uuid::new_v4().simple()));
+            let guard = PartialGuard {
+                path: Some(tmp_path.clone()),
+            };
+            let mut out = tokio::fs::File::create(&tmp_path).await?;
+
+            // 字段内 chunk 计数：单文件权威限制 = max_file_size
+            let mut size: u64 = 0;
+            let mut too_large = false;
+            let mut stream = field.into_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk =
+                    chunk.map_err(|_| AppError::BadRequest("读取文件数据失败".into()))?;
+                size += chunk.len() as u64;
+                if size > config.max_file_size {
+                    too_large = true;
+                    break;
+                }
+                out.write_all(&chunk).await?;
+            }
+
+            if too_large {
+                errors.push(format!("文件 \"{}\" 大小超过限制", file_name));
+                // guard Drop 清理 .part
+                continue;
+            }
+
+            out.flush().await?;
+            drop(out); // 关闭句柄，确保后续 rename 成功
+
+            let ext = StdPath::new(&file_name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase()
+                .to_string();
+
+            pending.push(PendingUpload {
+                guard,
+                stored_name: file_service::generate_stored_filename(&file_name),
+                file_name,
+                size: size as i64,
+                ext,
+            });
         }
     }
 
-    // 阶段 2：使用收集的元数据处理所有缓存的文件
-    for pf in pending_files {
-        let file_name = pf.file_name;
-        let data = pf.data;
+    // 确定上传归属用户：默认当前登录用户；若指定 user_id，则仅管理员可为他人上传
+    let owner_id: i64 = if let Some(target) = explicit_user {
+        let role: Option<(String,)> = sqlx::query_as("SELECT role FROM users WHERE id = ?")
+            .bind(auth.user_id)
+            .fetch_optional(&pool)
+            .await?;
+        if role.as_ref().map(|r| r.0.as_str()) != Some("admin") {
+            return Err(AppError::Forbidden("需要管理员权限才能为其他用户上传".into()));
+        }
+        let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM users WHERE id = ?")
+            .bind(target)
+            .fetch_optional(&pool)
+            .await?;
+        if exists.is_none() {
+            return Err(AppError::NotFound("目标用户不存在".into()));
+        }
+        target
+    } else {
+        auth.user_id
+    };
 
-        // 检查重复文件
-        if file_service::check_duplicates(&pool, auth.user_id, folder_id, &file_name).await? {
-            errors.push(format!("文件 \"{}\" 已存在，已跳过", file_name));
+    // 阶段 2：提交已流式落盘的待处理文件（.part -> rename 原子提交 + INSERT）
+    for pu in pending {
+        // 重复检查（此时已能确定 owner/folder）
+        if file_service::check_duplicates(&pool, owner_id, folder_id, &pu.file_name).await? {
+            errors.push(format!("文件 \"{}\" 已存在，已跳过", pu.file_name));
+            // pu 的 guard Drop 移除临时 .part
             continue;
         }
 
-        // 验证文件扩展名
-        if let Err(e) = file_service::validate_extension(&file_name) {
-            errors.push(e.message().to_string());
-            continue;
-        }
-
-        // 检查文件大小
-        if data.len() as u64 > config.max_file_size {
-            errors.push(format!("文件 \"{}\" 大小超过限制", file_name));
-            continue;
-        }
-
-        // 生成存储文件名
-        let stored_name = file_service::generate_stored_filename(&file_name);
-        let user_dir = file_service::user_upload_dir(&config, auth.user_id);
+        let user_dir = file_service::user_upload_dir(&config, owner_id);
         tokio::fs::create_dir_all(&user_dir).await?;
 
-        let stored_path = format!("user_{}/{}", auth.user_id, stored_name);
+        let stored_path = format!("user_{}/{}", owner_id, pu.stored_name);
         let full_path = config.upload_dir.join(&stored_path);
 
-        // 写入文件
-        let mut file = tokio::fs::File::create(&full_path).await?;
-        file.write_all(&data).await?;
+        // 同文件系统下 rename 原子提交
+        let src = pu.guard.path.clone().ok_or_else(|| {
+            AppError::Internal("内部状态错误：临时文件路径缺失".into())
+        })?;
+        tokio::fs::rename(&src, &full_path).await?;
 
-        // 确定文件类型
-        let ext = StdPath::new(&file_name)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
+        // 已提交，告知守卫勿删（临时文件已被重命名走）
+        let mut guard = pu.guard;
+        guard.path = None;
 
-        let size = data.len() as i64;
-
-        // 生成预览图（大，1616x1080）和缩略图（小，360x240）
-        let (preview_path, thumb_path) = if supports_preview(&ext) {
-            let preview_dir = file_service::user_preview_dir(&config, auth.user_id);
-            tokio::fs::create_dir_all(&preview_dir).await?;
-
-            let preview_name = format!("{}.jpg", Uuid::new_v4().simple());
-            let preview_rel = format!("user_{}/previews/{}", auth.user_id, preview_name);
-            let preview_full = config.upload_dir.join(&preview_rel);
-
-            let thumb_name = format!("{}_thumb.jpg", Uuid::new_v4().simple());
-            let thumb_rel = format!("user_{}/previews/{}", auth.user_id, thumb_name);
-            let thumb_full = config.upload_dir.join(&thumb_rel);
-
-            let preview_result = preview_service::generate_preview(&full_path, &preview_full, &ext).await;
-            let thumb_result = preview_service::generate_thumbnail(&full_path, &thumb_full, &ext).await;
-
-            match (preview_result, thumb_result) {
-                (Ok(()), Ok(())) => (Some(preview_rel), Some(thumb_rel)),
-                (Ok(()), Err(e)) => {
-                    tracing::warn!("Thumbnail generation failed: {:?}", e);
-                    let _ = tokio::fs::remove_file(&thumb_full).await;
-                    (Some(preview_rel), None)
-                }
-                (Err(e), Ok(())) => {
-                    tracing::warn!("Preview generation failed: {:?}", e);
-                    let _ = tokio::fs::remove_file(&preview_full).await;
-                    (None, Some(thumb_rel))
-                }
-                (Err(e1), Err(e2)) => {
-                    tracing::warn!("Preview generation failed: {:?}, thumbnail: {:?}", e1, e2);
-                    let _ = tokio::fs::remove_file(&preview_full).await;
-                    let _ = tokio::fs::remove_file(&thumb_full).await;
-                    (None, None)
-                }
-            }
-        } else {
-            (None, None)
-        };
-
-        // 保存到数据库
+        // 先写库（preview_path/thumb_path = NULL），缩略图在后台异步补齐
         let file_record = sqlx::query_as::<_, File>(
             r#"INSERT INTO files (name, original_name, stored_path, preview_path, thumb_path, owner_id, folder_id, size, file_type)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *"#,
         )
-        .bind(&file_name)
-        .bind(&file_name)
+        .bind(&pu.file_name)
+        .bind(&pu.file_name)
         .bind(&stored_path)
-        .bind(&preview_path)
-        .bind(&thumb_path)
-        .bind(auth.user_id)
+        .bind(Option::<String>::None) // preview_path 由后台任务补齐
+        .bind(Option::<String>::None) // thumb_path 由后台任务补齐
+        .bind(owner_id)
         .bind(folder_id)
-        .bind(size)
-        .bind(&ext)
+        .bind(pu.size)
+        .bind(&pu.ext)
         .fetch_one(&pool)
         .await?;
+
+        // 后台生成预览图 + 缩略图（spawn_blocking 包裹同步图像处理 + 信号量限并发）
+        if file_service::supports_preview(&pu.ext) {
+            spawn_preview_task(
+                sem.clone(),
+                pool.clone(),
+                config.clone(),
+                owner_id,
+                file_record.id,
+                full_path,
+                pu.ext.clone(),
+            );
+        }
 
         let info = file_record.to_info();
         uploaded_files.push(serde_json::to_value(info)?);
@@ -197,6 +264,48 @@ pub async fn upload_files(
         },
         "error": null
     })))
+}
+
+/// 后台生成某文件预览图与缩略图：
+/// 先经信号量限并发，再通过 spawn_blocking 跑同步图像处理，最后 UPDATE files 表。
+///
+/// 丢失/失败不影响已上传文件本身（media 接口已有回退到原图的降级逻辑）。
+fn spawn_preview_task(
+    sem: Arc<Semaphore>,
+    pool: SqlitePool,
+    config: Config,
+    owner_id: i64,
+    file_id: i64,
+    src_path: PathBuf,
+    ext: String,
+) {
+    tokio::spawn(async move {
+        let Ok(permit) = sem.acquire_owned().await else {
+            tracing::warn!("预览并发闸未获许可: file_id={}", file_id);
+            return;
+        };
+
+        let res = tokio::task::spawn_blocking(move || {
+            preview_service::generate_preview_and_thumb(&config, owner_id, &src_path, &ext)
+        })
+        .await;
+
+        match res {
+            Ok((preview_rel, thumb_rel)) => {
+                let _ = sqlx::query(
+                    "UPDATE files SET preview_path = ?, thumb_path = ? WHERE id = ?",
+                )
+                .bind(preview_rel)
+                .bind(thumb_rel)
+                .bind(file_id)
+                .execute(&pool)
+                .await;
+            }
+            Err(e) => tracing::warn!("预览后台任务失败: file_id={} err={:?}", file_id, e),
+        }
+        // permit 于作用域结束自动归还
+        drop(permit);
+    });
 }
 
 /// GET /api/files/:id/download?token=<jwt> 下载文件
@@ -405,11 +514,10 @@ pub async fn restore_file(
 /// DELETE /api/files/:id/permanent 永久删除文件（从回收站）
 pub async fn permanent_delete_file(
     State(pool): State<SqlitePool>,
-    State(config): State<Config>,
     auth: AuthUser,
     Path(file_id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
-    file_service::delete_file(&pool, &config, file_id, auth.user_id).await?;
+    file_service::delete_file(&pool, file_id, auth.user_id).await?;
     Ok(Json(json!({
         "success": true,
         "data": null,
@@ -438,9 +546,18 @@ pub async fn list_trash(
 pub async fn empty_trash(
     State(pool): State<SqlitePool>,
     State(config): State<Config>,
+    State(sem): State<Arc<Semaphore>>,
     auth: AuthUser,
 ) -> Result<Json<Value>, AppError> {
-    let file_count = file_service::empty_trash(&pool, &config, auth.user_id).await?;
+    let file_count = file_service::empty_trash(&pool, auth.user_id).await?;
+
+    // 触发一次即时 GC，立即释放本次硬删产生的磁盘空间（无需等周期任务）
+    tokio::spawn(async move {
+        if let Err(e) = crate::services::sweeper::run_once(&pool, &config, sem.clone()).await {
+            tracing::warn!("清空回收站后的即时 GC 失败: {:?}", e);
+        }
+    });
+
     Ok(Json(json!({
         "success": true,
         "data": {

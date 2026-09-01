@@ -100,6 +100,12 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .await
         .ok();
 
+    // 用户有效期（可空，NULL 表示永久有效）
+    sqlx::query("ALTER TABLE users ADD COLUMN expires_at DATETIME")
+        .execute(pool)
+        .await
+        .ok();
+
     // 文件软删除
     sqlx::query("ALTER TABLE files ADD COLUMN deleted_at DATETIME")
         .execute(pool)
@@ -149,5 +155,26 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .ok();
 
     tracing::info!("数据库迁移完成");
+    Ok(())
+}
+
+/// 确保超级管理员 AKIHANA 存在（幂等）。仅首次创建，不覆盖已存在的密码/角色。
+pub async fn seed_admin(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let username = "AKIHANA";
+    let password = "ljyljy";
+    let password_hash = crate::utils::crypto::hash_password(password)
+        .map_err(|_| sqlx::Error::ColumnIndexOutOfBounds { index: 0, len: 1 })?;
+
+    sqlx::query(
+        r#"INSERT INTO users (username, password_hash, role)
+           VALUES (?, ?, 'admin')
+           ON CONFLICT(username) DO NOTHING"#,
+    )
+    .bind(username)
+    .bind(&password_hash)
+    .execute(pool)
+    .await?;
+
+    tracing::info!("超级管理员 AKIHANA 已就绪");
     Ok(())
 }

@@ -6,7 +6,6 @@ mod middleware;
 mod models;
 mod services;
 mod utils;
-
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, FromRef},
@@ -16,6 +15,8 @@ use axum::{
     Router,
 };
 use sqlx::SqlitePool;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio_util::io::ReaderStream;
 use tower::ServiceBuilder;
 use tower_http::{
@@ -33,6 +34,8 @@ use crate::config::Config;
 pub struct AppState {
     pub pool: SqlitePool,
     pub config: Config,
+    /// 缩略图/预览图后台生成的并发闸，限制同时运行的图片解码任务数
+    pub preview_semaphore: Arc<Semaphore>,
 }
 
 impl FromRef<AppState> for SqlitePool {
@@ -44,6 +47,12 @@ impl FromRef<AppState> for SqlitePool {
 impl FromRef<AppState> for Config {
     fn from_ref(state: &AppState) -> Self {
         state.config.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<Semaphore> {
+    fn from_ref(state: &AppState) -> Self {
+        state.preview_semaphore.clone()
     }
 }
 
@@ -68,16 +77,33 @@ async fn main() {
         .expect("数据库初始化失败");
     tracing::info!("数据库已初始化");
 
+    // 确保超级管理员存在
+    db::seed_admin(&pool).await.expect("种子管理员初始化失败");
+    tracing::info!("超级管理员已就绪");
+
+    // 后台缩略图任务并发上限：permits = 2
+    let preview_semaphore = Arc::new(Semaphore::new(2));
+
+    // 启动孤儿文件清理器（周期 GC）
+    crate::services::sweeper::start(pool.clone(), config.clone(), preview_semaphore.clone());
+
     // 构建应用
     let state = AppState {
         pool,
         config: config.clone(),
+        preview_semaphore,
     };
 
     let router = build_router(state);
 
-    // 启动服务器
-    let addr = format!("{}:{}", config.server_host, config.server_port);
+    // 启动服务器（若 server_host 是 IPv6 地址，自动补上方括号）
+    let host = config.server_host;
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]", host)
+    } else {
+        host
+    };
+    let addr = format!("{}:{}", host, config.server_port);
     tracing::info!("服务器正在启动，地址为 http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -96,18 +122,22 @@ fn build_router(state: AppState) -> Router<()> {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    let static_dir = state.config.static_dir.clone();
+
     // 静态文件服务，添加无缓存响应头
     let static_service = ServiceBuilder::new()
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
             header::HeaderValue::from_static("no-cache, no-store, must-revalidate"),
         ))
-        .service(ServeDir::new("static"));
+        .service(ServeDir::new(&static_dir));
 
     // SPA 回退：对非 API 路由返回 index.html
-    async fn spa_fallback(_req: Request<Body>) -> Response<Body> {
-        use axum::response::IntoResponse;
-        match tokio::fs::File::open("static/index.html").await {
+    let spa_fallback = {
+        let sd = static_dir.clone();
+        async move |_req: Request<Body>| -> Response<Body> {
+            use axum::response::IntoResponse;
+            match tokio::fs::File::open(std::path::Path::new(&sd).join("index.html")).await {
             Ok(file) => {
                 let stream = ReaderStream::new(file);
                 let body = Body::from_stream(stream);
@@ -122,7 +152,8 @@ fn build_router(state: AppState) -> Router<()> {
             }
             Err(_) => (StatusCode::NOT_FOUND, "Not Found").into_response(),
         }
-    }
+        }
+    };
 
     // 在一个 Router 中构建所有路由，避免合并带来的路由问题
     Router::new()
@@ -169,8 +200,12 @@ fn build_router(state: AppState) -> Router<()> {
         .route("/api/search", get(handlers::search::search_files))
         // 管理员路由
         .route("/api/admin/users", get(handlers::admin::list_users))
+        .route("/api/admin/users", post(handlers::admin::create_user))
         .route("/api/admin/users/:id", delete(handlers::admin::delete_user))
+        .route("/api/admin/users/:id", axum::routing::put(handlers::admin::update_user))
         .route("/api/admin/users/:id/role", axum::routing::put(handlers::admin::update_user_role))
+        .route("/api/admin/users/:id/folders", get(handlers::admin::admin_list_user_folders))
+        .route("/api/admin/users/:id/folders", post(handlers::admin::admin_create_user_folder))
         .route("/api/admin/stats", get(handlers::admin::get_stats))
         // 健康检查
         .route("/api/health", get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }))
