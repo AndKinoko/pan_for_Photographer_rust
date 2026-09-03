@@ -98,7 +98,7 @@ Vite 开发服务器会代理 `/api` 到后端，配合 `cargo run` 使用。开
 - `8001`：普通用户前端（`static_user/`）
 - `8002`：管理端前端（`static_admin/`）
 
-> 注意：`static_user/`、`static_admin/` 属于非默认资产，已在 `.gitignore` 中忽略、不随仓库提交。若需要双端口模式，请从你的本地副本保留这两个目录。
+> 注意：普通用户前端只能登录，预览，下载，如果在超级管理员设置了普通用户的生命周期，到期则删除对应用户和对应文件。普通用户前端只做临时保存和影像交付使用。
 
 ## 项目结构
 
@@ -131,9 +131,9 @@ pan_for_Photographer/
 | POST | `/api/files/upload` | 上传文件（multipart 流式） |
 | GET  | `/api/files/:id/download` | 下载文件 |
 | GET  | `/api/files/:id/media` | 预览 / 缩略图 / 原图 |
-| DELETE | `/api/files/:id` | 软删除 |
-| DELETE | `/api/files/:id/permanent` | 永久删除 |
-| DELETE | `/api/trash` | 清空回收站（并触发即时 GC） |
+| 删除 | `/api/files/:id` | 软删除 |
+| 删除 | `/api/files/:id/permanent` | 永久删除 |
+| 删除 | `/api/trash` | 清空回收站（并触发即时 GC） |
 | GET  | `/api/folders` | 文件夹列表 |
 | GET  | `/api/search` | 全局搜索 |
 | GET  | `/api/public/shares/:id` | 公开分享详情 |
@@ -141,7 +141,7 @@ pan_for_Photographer/
 
 ## 存储与后台任务说明
 
-- **上传**：multipart 字段以 chunk 流式写入 `uploads/.tmp_incoming/*.part`，完成后 `rename` 原子提交到 `user_<id>/`，随后 INSERT 数据库并立即响应；超限文件在流内计数阶段即被拒绝（413）。
+- **上传**：multipart 字段以 chunk 流式写入 `uploads/.tmp_incoming/*.part`，完成后 `重命名` 原子提交到 `user_<id>/`，随后 INSERT 数据库并立即响应；超限文件在流内计数阶段即被拒绝（413）。
 - **缩略图**：插入时 `preview_path/thumb_path` 为 NULL，后台任务（`spawn_blocking` + 信号量限并发）生成后 UPDATE。生成完成前前端会自动轮询补齐，无需手动刷新。
 - **孤儿清理（GC）**：周期扫描 `uploads/`，对账数据库——孤儿源文件/预览（超 5 分钟）、超龄 `.part`（超 1 小时）会被删除；`preview_path IS NULL` 的图片行自动重新入队补生成。
 
