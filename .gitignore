@@ -20,10 +20,6 @@ desktop.ini
 # Standalone static frontends for the dual-port launcher (start_publish.bat).
 # Not the default runtime (default is start_server.bat + /static/ build);
 # kept locally but not committed to keep the repo small.
-/static_user/
-/static_admin/
-
-
 
 # Package manager logs
 npm-debug.log*

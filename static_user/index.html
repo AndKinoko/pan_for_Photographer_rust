@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#6366f1" />
+    <title>影像交付 · 摄影师网盘</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body data-view="boot">
+    <!-- 登录 -->
+    <div id="login" class="auth hidden">
+      <div class="auth-card">
+        <div class="brand">
+          <span class="logo">📷</span>
+          <div>
+            <h1>影像交付</h1>
+            <p class="muted">摄影师 · 原图交付</p>
+          </div>
+        </div>
+        <form id="login-form" class="form">
+          <div class="field">
+            <label for="username">用户名</label>
+            <input id="username" class="input" type="text" autocomplete="username" placeholder="请输入用户名" />
+          </div>
+          <div class="field">
+            <label for="password">密码</label>
+            <input id="password" class="input" type="password" autocomplete="current-password" placeholder="请输入密码" />
+          </div>
+          <p id="login-err" class="err hidden"></p>
+          <button id="login-btn" class="btn btn-primary btn-block" type="submit">登 录</button>
+        </form>
+      </div>
+    </div>
+
+    <!-- 主界面 -->
+    <div id="app-view" class="layout hidden">
+      <header class="topbar">
+        <div class="brand brand-inline">
+          <span class="logo">📷</span>
+          <strong>影像交付</strong>
+        </div>
+        <div class="grow"></div>
+        <span id="user-name" class="user-name"></span>
+        <button id="logout-btn" class="btn btn-sm btn-ghost">退出</button>
+      </header>
+
+      <main class="content">
+        <nav id="breadcrumb" class="crumb" aria-label="路径"></nav>
+
+        <div id="loading" class="state hidden">
+          <div class="spinner"></div>
+          <p>加载中…</p>
+        </div>
+
+        <div id="empty" class="state hidden">
+          <span class="emoji">📂</span>
+          <h3>此文件夹为空</h3>
+          <p>暂无文件</p>
+        </div>
+
+        <div id="error" class="state hidden">
+          <span class="emoji">⚠️</span>
+          <h3>加载失败</h3>
+          <p id="error-msg"></p>
+          <button id="retry-btn" class="btn btn-primary btn-sm">重试</button>
+        </div>
+
+        <section id="folder-section" class="section hidden">
+          <h2 class="sec-title">文件夹</h2>
+          <div id="folders" class="grid"></div>
+        </section>
+
+        <section id="file-section" class="section hidden">
+          <div class="sec-head">
+            <h2 class="sec-title">文件</h2>
+            <div class="batch-actions">
+              <label class="chk"><input id="sel-all" type="checkbox" /> 全选</label>
+              <button id="batch-dl" class="btn btn-sm btn-primary" disabled>⬇ 批量下载</button>
+            </div>
+          </div>
+          <div id="files" class="grid"></div>
+        </section>
+      </main>
+    </div>
+
+    <!-- 预览灯箱 -->
+    <div id="lightbox" class="overlay hidden" role="dialog" aria-modal="true">
+      <div class="lb-head">
+        <span id="lb-name" class="lb-name"></span>
+        <div class="lb-actions">
+          <button id="lb-download" class="btn btn-sm btn-primary">⬇ 下载</button>
+          <button id="lb-close" class="btn btn-sm btn-ghost">✕ 关闭</button>
+        </div>
+      </div>
+      <div class="lb-stage">
+        <button id="lb-prev" class="lb-nav" aria-label="上一张">‹</button>
+        <div id="lb-body" class="lb-body"></div>
+        <button id="lb-next" class="lb-nav" aria-label="下一张">›</button>
+      </div>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="app.js"></script>
+  </body>
+</html>

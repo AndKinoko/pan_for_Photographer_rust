@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#6366f1" />
+    <title>摄影师网盘 · 管理端</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body data-view="boot">
+    <!-- 登录 -->
+    <div id="login" class="auth hidden">
+      <div class="auth-card">
+        <div class="brand">
+          <span class="logo">⚙️</span>
+          <div>
+            <h1>摄影师网盘</h1>
+            <p class="muted">管理端 · 用户与交付管理</p>
+          </div>
+        </div>
+        <form id="login-form" class="form">
+          <div class="field">
+            <label for="username">管理员账号</label>
+            <input id="username" class="input" type="text" autocomplete="username" placeholder="超级管理员账号" />
+          </div>
+          <div class="field">
+            <label for="password">密码</label>
+            <input id="password" class="input" type="password" autocomplete="current-password" placeholder="请输入密码" />
+          </div>
+          <p id="login-err" class="err hidden"></p>
+          <button id="login-btn" class="btn btn-primary btn-block" type="submit">登 录</button>
+        </form>
+      </div>
+    </div>
+
+    <!-- 主界面 -->
+    <div id="app-view" class="layout hidden">
+      <header class="topbar">
+        <div class="brand brand-inline">
+          <span class="logo">⚙️</span>
+          <strong>摄影师网盘 · 管理端</strong>
+        </div>
+        <div class="grow"></div>
+        <span id="user-name" class="user-name"></span>
+        <button id="logout-btn" class="btn btn-sm btn-ghost">退出</button>
+      </header>
+
+      <main class="content">
+        <!-- 统计 -->
+        <div id="stats" class="stats hidden"></div>
+
+        <!-- 工具栏 -->
+        <div class="toolbar">
+          <h2 class="sec-title">普通用户管理</h2>
+          <div class="actions">
+            <button id="refresh-btn" class="btn btn-sm btn-ghost">刷新</button>
+            <button id="create-btn" class="btn btn-sm btn-primary">＋ 新建用户</button>
+          </div>
+        </div>
+
+        <div id="loading" class="state hidden"><div class="spinner"></div><p>加载中…</p></div>
+        <div id="error" class="state hidden">
+          <span class="emoji">⚠️</span>
+          <h3>加载失败</h3>
+          <p id="error-msg"></p>
+          <button id="retry-btn" class="btn btn-primary btn-sm">重试</button>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>账号</th>
+                <th>角色</th>
+                <th>有效期</th>
+                <th>文件数</th>
+                <th>创建时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="user-rows"></tbody>
+          </table>
+        </div>
+        <p id="empty-users" class="state hidden"><span class="emoji">👥</span><h3>暂无用户</h3></p>
+      </main>
+    </div>
+
+    <!-- 新建用户 -->
+    <div id="create-modal" class="modal-wrap hidden">
+      <div class="modal card">
+        <div class="modal-head"><h3>新建用户</h3><button class="btn-icon modal-close" data-close>✕</button></div>
+        <div class="field">
+          <label>用户名 *</label>
+          <input id="cu-username" class="input" type="text" placeholder="登录账号" />
+        </div>
+        <div class="field">
+          <label>初始密码 *（至少 6 位）</label>
+          <input id="cu-password" class="input" type="password" placeholder="初始密码" />
+        </div>
+        <div class="field">
+          <label>角色</label>
+          <select id="cu-role" class="select">
+            <option value="user">普通用户</option>
+            <option value="admin">管理员</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>有效期（可选，留空 = 永久有效）</label>
+          <div class="row">
+            <input id="cu-expires" class="input" type="datetime-local" />
+            <button id="cu-clear-exp" class="btn btn-sm btn-ghost" type="button">清除</button>
+          </div>
+        </div>
+        <p id="create-err" class="err hidden"></p>
+        <div class="modal-actions">
+          <button class="btn btn-ghost" data-close>取消</button>
+          <button id="create-save" class="btn btn-primary">创建</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 编辑用户 -->
+    <div id="edit-modal" class="modal-wrap hidden">
+      <div class="modal card">
+        <div class="modal-head"><h3>编辑用户</h3><button class="btn-icon modal-close" data-close>✕</button></div>
+        <div class="field">
+          <label>用户名</label>
+          <input id="eu-username" class="input" type="text" />
+        </div>
+        <div class="field">
+          <label>重置密码（留空则不修改）</label>
+          <input id="eu-password" class="input" type="password" placeholder="留空保持不变" />
+        </div>
+        <div class="field">
+          <label>角色</label>
+          <select id="eu-role" class="select">
+            <option value="user">普通用户</option>
+            <option value="admin">管理员</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>有效期</label>
+          <div class="row">
+            <input id="eu-expires" class="input" type="datetime-local" />
+            <button id="eu-permanent" class="btn btn-sm btn-ghost" type="button">永久有效</button>
+          </div>
+          <label class="check"><input id="eu-keep" type="checkbox" checked /> 保留当前有效期（勾选则不更改）</label>
+        </div>
+        <p id="edit-err" class="err hidden"></p>
+        <div class="modal-actions">
+          <button class="btn btn-ghost" data-close>取消</button>
+          <button id="edit-save" class="btn btn-primary">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 上传 -->
+    <div id="upload-modal" class="modal-wrap hidden">
+      <div class="modal card">
+        <div class="modal-head">
+          <h3>为「<span id="up-username"></span>」批量上传</h3>
+          <button class="btn-icon modal-close" data-close>✕</button>
+        </div>
+        <div class="field">
+          <label>上传到该用户的文件夹</label>
+          <div class="row">
+            <select id="up-folder-select" class="select"></select>
+            <button id="up-newfolder" class="btn btn-sm btn-ghost" type="button">＋ 新建文件夹</button>
+          </div>
+          <p id="up-folder-note" class="muted small"></p>
+        </div>
+        <label id="up-drop" class="drop">
+          <input id="up-input" type="file" multiple hidden />
+          <span class="drop-text">点击选择或拖拽图片至此<br /><small class="muted">支持批量选择多张图片</small></span>
+        </label>
+        <div id="up-progress" class="progress hidden"><div></div></div>
+        <ul id="up-list" class="drop-list"></ul>
+        <p id="up-result" class="info hidden"></p>
+        <div class="modal-actions">
+          <button class="btn btn-ghost" data-close>完成</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="app.js"></script>
+  </body>
+</html>
