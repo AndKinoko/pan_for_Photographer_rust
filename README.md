@@ -119,13 +119,14 @@ cargo run --release
 
 ---
 
-## 双端口发布模式（可选，`start_publish.bat`）
+## 双端口发布（`start_publish.bat`，可选）
 
-- `8001`：普通用户前端（`static_user/`）
-- `8002`：管理端前端（`static_admin/`）
+管理端功能已并入 Vue 主站（`/admin`），不再需要独立管理前端；普通用户交付端 `static_user/` 保留（供客户只读取片）。
 
-> 普通用户端只能登录、预览、下载；管理员可在管理端设置普通用户生命周期，到期后自动清理其账户和文件。
-> 双端口模式也需要通过 `SEED_ADMIN_USERNAME` / `SEED_ADMIN_PASSWORD` 设置初始管理员。
+- `8001`：影像交付端（`static_user/`）——客户只读：登录 / 浏览 / 预览 / 下载
+- `0100`：统一 Vue 前端（`static/`）——完整功能 + 管理端（admin 登录后访问 `/admin`：用户管理 / 有效期 / 新建·编辑用户 / 为指定用户上传原图 / 系统统计）
+
+> 两端口共用同一数据库与上传目录。超管账号由 `SEED_ADMIN_USERNAME` / `SEED_ADMIN_PASSWORD` 环境变量控制（首次启动时设置）。
 
 ---
 
@@ -170,10 +171,9 @@ pan_for_Photographer/
 │   ├── db.rs               # 数据库迁移与种子管理员
 │   └── main.rs             # 入口、路由、后台任务
 ├── frontend/               # Vue 3 前端源码（npm run build → ../static/）
-├── static_user/            # 双端口发布 - 普通用户独立前端（提交到 git）
-├── static_admin/           # 双端口发布 - 管理员独立前端（提交到 git）
+├── static_user/            # 影像交付端（保留） - 只读：登录/浏览/预览/下载，供客户取片
 ├── start_server.bat        # 默认启动脚本（单端口 + Vue 前端）
-├── start_publish.bat       # 可选双端口启动脚本
+├── start_publish.bat       # 发布脚本：交付端(static_user) + 统一前端(static)
 ├── .gitignore
 └── README.md
 ```

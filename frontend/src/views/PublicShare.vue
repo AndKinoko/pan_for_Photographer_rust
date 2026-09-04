@@ -25,6 +25,7 @@ const needsPassword = ref(false)
 const password = ref('')
 const verifying = ref(false)
 const verified = ref(false)
+const ticket = ref('')
 
 const id = computed(() => route.params.id)
 
@@ -46,10 +47,10 @@ const isFolder = computed(() => share.value?.file_type === 'folder')
 
 function downloadShared() {
   if (!share.value) return
-  // 下载进入全局下载队列（公开无 token）
+  // 下载进入全局下载队列（公开分享使用访问凭证，无用户 token）
   transfer.enqueueDownload({
     filename: share.value.file_name,
-    url: publicShareDownloadUrl(share.value.id),
+    url: publicShareDownloadUrl(share.value.id, ticket.value),
     authed: false,
   })
 }
@@ -84,7 +85,9 @@ async function verify() {
   }
   verifying.value = true
   try {
-    await verifySharePassword(id.value, password.value)
+    const data = await verifySharePassword(id.value, password.value)
+    // 后端签发与本次分享绑定的短时效访问凭证，媒体与下载请求需携带它
+    ticket.value = data?.ticket || ''
     verified.value = true
     needsPassword.value = false
     toast.success('密码正确')
@@ -93,6 +96,13 @@ async function verify() {
   } finally {
     verifying.value = false
   }
+}
+
+/** 给媒体/缩略图 URL 追加访问凭证（受密码保护时）。 */
+function withTicket(url) {
+  if (!url || !ticket.value) return url
+  const sep = url.includes('?') ? '&' : '?'
+  return `${url}${sep}ticket=${encodeURIComponent(ticket.value)}`
 }
 
 function onKeydown(e) {
@@ -164,7 +174,7 @@ onMounted(load)
         <span class="thumb">
           <img
             v-if="isImage && share.thumb_url"
-            :src="share.thumb_url"
+            :src="withTicket(share.thumb_url)"
             alt=""
             @error="$event.target.style.display = 'none'"
           />
@@ -191,16 +201,17 @@ onMounted(load)
       <div v-if="canShowMedia && share.preview_url" class="media">
         <img
           v-if="isImage"
-          :src="share.preview_url"
+          :src="withTicket(share.preview_url)"
           :alt="share.file_name"
         />
-        <video v-else-if="isVideo" :src="share.preview_url" controls />
-        <audio v-else-if="isAudio" :src="share.preview_url" controls />
+        <video v-else-if="isVideo" :src="withTicket(share.preview_url)" controls />
+        <audio v-else-if="isAudio" :src="withTicket(share.preview_url)" controls />
         <iframe
           v-else-if="isPdf"
-          :src="share.preview_url"
+          :src="withTicket(share.preview_url)"
           class="pdf"
           title="PDF 预览"
+          sandbox="allow-same-origin allow-downloads"
         />
       </div>
 

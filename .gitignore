@@ -46,6 +46,11 @@ secret.key
 .env.local
 .env.*.local
 
+# ───────── 废弃前端 ─────────
+# static_admin 管理端独立前端已删除并归档（管理功能并入 Vue /admin），
+# 若历史遗留重新出现（如从备份恢复），也不应被提交
+/static_admin/
+
 # ───────── 包管理器日志 ─────────
 npm-debug.log*
 yarn-debug.log*

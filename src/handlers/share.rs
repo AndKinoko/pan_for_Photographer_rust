@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::Response,
     Json,
@@ -14,7 +14,19 @@ use crate::errors::AppError;
 use crate::middleware::auth::AuthUser;
 use crate::services::share_service;
 use crate::services::file_service;
+use crate::utils::crypto;
 use sqlx::SqlitePool;
+
+/// 受密码保护分享的访问凭证有效期（秒）。默认 2 小时。
+const SHARE_TICKET_TTL_SECS: i64 = 2 * 60 * 60;
+
+/// 从查询参数中提取并校验分享访问凭证。
+fn check_share_ticket(config: &Config, share_id: &str, params: &std::collections::HashMap<String, String>) -> bool {
+    match params.get("ticket") {
+        Some(t) => crypto::verify_share_ticket(config, share_id, t),
+        None => false,
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct CreateShareRequest {
@@ -119,15 +131,18 @@ pub async fn public_share_access(
 /// POST /api/public/shares/:id/verify 验证分享密码
 pub async fn public_verify_password(
     State(pool): State<SqlitePool>,
+    State(config): State<Config>,
     Path(share_id): Path<String>,
     Json(req): Json<VerifyShareRequest>,
 ) -> Result<Json<Value>, AppError> {
     let valid = share_service::verify_share_password(&pool, &share_id, &req.password).await?;
 
     if valid {
+        // 密码正确，签发与分享绑定的短时效访问凭证
+        let ticket = crypto::create_share_ticket(&config, &share_id, SHARE_TICKET_TTL_SECS);
         Ok(Json(json!({
             "success": true,
-            "data": { "verified": true },
+            "data": { "verified": true, "ticket": ticket },
             "error": null
         })))
     } else {
@@ -140,9 +155,15 @@ pub async fn public_share_download(
     State(pool): State<SqlitePool>,
     State(config): State<Config>,
     Path(share_id): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response, AppError> {
     // 先验证分享的有效性
     let share = share_service::validate_share(&pool, &share_id).await?;
+
+    // 密码保护的分享必须提供有效访问凭证，否则拒绝系统内容
+    if !share.password_hash.is_empty() && !check_share_ticket(&config, &share_id, &params) {
+        return Err(AppError::Unauthorized("需要访问密码".into()));
+    }
 
     // 获取文件信息（文件夹分享暂不支持直接下载）
     let file_id = share.file_id.ok_or_else(|| {
@@ -187,6 +208,11 @@ pub async fn public_share_media(
 ) -> Result<Response, AppError> {
     // 验证分享的有效性
     let share = share_service::validate_share(&pool, &share_id).await?;
+
+    // 密码保护的分享必须提供有效访问凭证，否则拒绝系统内容
+    if !share.password_hash.is_empty() && !check_share_ticket(&config, &share_id, &params) {
+        return Err(AppError::Unauthorized("需要访问密码".into()));
+    }
 
     // 获取文件信息（文件夹分享暂不支持媒体预览）
     let file_id = share.file_id.ok_or_else(|| {
@@ -240,6 +266,8 @@ pub async fn public_share_media(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime.as_ref())
         .header(header::CACHE_CONTROL, "public, max-age=3600")
+        // 防止响应内容被嗅探成 text/html，堵塞 MIME 混淆 XSS
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(body)
         .map_err(|_| AppError::Internal("响应构建失败".into()))?)
 }

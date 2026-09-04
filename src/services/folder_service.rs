@@ -130,11 +130,14 @@ pub async fn soft_delete_folder(
         }
     }
 
+    // 开启事务，保证递归软删除要么全部生效、要么全部回滚
+    let mut tx = pool.begin().await?;
+
     // 软删除所有子文件夹中的文件
     for fid in &folder_ids {
         sqlx::query("UPDATE files SET deleted_at = datetime('now') WHERE folder_id = ? AND deleted_at IS NULL")
             .bind(fid)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     }
 
@@ -142,9 +145,11 @@ pub async fn soft_delete_folder(
     for fid in &folder_ids {
         sqlx::query("UPDATE folders SET deleted_at = datetime('now') WHERE id = ? AND deleted_at IS NULL")
             .bind(fid)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     }
+
+    tx.commit().await?;
 
     tracing::info!("文件夹已移入回收站: id={}, 含 {} 个子文件夹", folder_id, folder_ids.len());
     Ok(())
@@ -200,11 +205,14 @@ pub async fn restore_folder(
         }
     }
 
+    // 开启事务，保证恢复流程（含父目录迁移）整体生效
+    let mut tx = pool.begin().await?;
+
     // 恢复所有文件夹
     for fid in &folder_ids {
         sqlx::query("UPDATE folders SET deleted_at = NULL WHERE id = ?")
             .bind(fid)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     }
 
@@ -212,7 +220,7 @@ pub async fn restore_folder(
     for fid in &folder_ids {
         sqlx::query("UPDATE files SET deleted_at = NULL WHERE folder_id = ?")
             .bind(fid)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     }
 
@@ -220,9 +228,11 @@ pub async fn restore_folder(
     if restore_to_root {
         sqlx::query("UPDATE folders SET parent_id = NULL WHERE id = ?")
             .bind(folder_id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     }
+
+    tx.commit().await?;
 
     tracing::info!("文件夹已从回收站恢复: id={}", folder_id);
     Ok(())
@@ -283,11 +293,14 @@ pub async fn permanently_delete_folder(
         }
     }
 
+    // 开启事务，保证文件记录与文件夹记录删除要么全部成功、要么全部回滚
+    let mut tx = pool.begin().await?;
+
     // 删除所有文件夹中的文件记录（物理文件交由 GC 处理）
     for fid in &folder_ids {
         sqlx::query("DELETE FROM files WHERE folder_id = ?")
             .bind(fid)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     }
 
@@ -295,9 +308,11 @@ pub async fn permanently_delete_folder(
     for fid in folder_ids.iter().rev() {
         sqlx::query("DELETE FROM folders WHERE id = ?")
             .bind(fid)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     }
+
+    tx.commit().await?;
 
     tracing::info!("文件夹已永久删除: id={}", folder_id);
     Ok(())

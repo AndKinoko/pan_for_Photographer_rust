@@ -9,7 +9,7 @@ mod utils;
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, FromRef},
-    http::{Request, StatusCode, header},
+    http::{header, Method, Request, StatusCode},
     response::Response,
     routing::{delete, get, post},
     Router,
@@ -20,7 +20,7 @@ use tokio::sync::Semaphore;
 use tokio_util::io::ReaderStream;
 use tower::ServiceBuilder;
 use tower_http::{
-    cors::{AllowOrigin, Any, CorsLayer},
+    cors::{AllowOrigin, CorsLayer},
     services::ServeDir,
     set_header::SetResponseHeaderLayer,
     trace::TraceLayer,
@@ -116,11 +116,17 @@ async fn main() {
 }
 
 fn build_router(state: AppState) -> Router<()> {
-    // 改用 AllowOrigin::mirror_request() 以反射请求 Origin，比完全开放更安全
+    // 只放行受信任的来源，反射任意请求 Origin 会放宽同源策略，造成跨站可利用面。
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::mirror_request())
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(allowed_cors_origins())
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
     let static_dir = state.config.static_dir.clone();
 
@@ -163,7 +169,12 @@ fn build_router(state: AppState) -> Router<()> {
         .route("/api/auth/me", get(handlers::auth::me))
         // 文件路由
         .route("/api/files", get(handlers::files::list_files))
-        .route("/api/files/upload", post(handlers::files::upload_files))
+        // 仅上传路由放开大数据量请求体上限；其余接口保持 axum 默认较小限制，缩小 DoS 面
+        .route(
+            "/api/files/upload",
+            post(handlers::files::upload_files)
+                .layer(DefaultBodyLimit::max(state.config.max_file_size as usize)),
+        )
         .route("/api/files/:id/download", get(handlers::files::download_file))
         .route("/api/files/:id/media", get(handlers::files::serve_media))
         .route("/api/files/:id", delete(handlers::files::delete_file))
@@ -215,6 +226,44 @@ fn build_router(state: AppState) -> Router<()> {
         .fallback_service(static_service)
         .layer(TraceLayer::new_for_http())
         .layer(cors)
-        .layer(DefaultBodyLimit::max(state.config.max_file_size as usize))
         .with_state(state)
+}
+
+/// 构建 CORS 白名单来源：来自环境变量 CORS_ALLOWED_ORIGINS（空格或逗号分隔），
+/// 并始终包含本地开发 / 双端口发布常用来源，便于局域网与开发模式使用。
+fn allowed_cors_origins() -> AllowOrigin {
+    let mut origins: Vec<header::HeaderValue> = vec![];
+
+    // 环境变量追加
+    if let Ok(env) = std::env::var("CORS_ALLOWED_ORIGINS") {
+        for part in env.split([',', ' ']) {
+            let part = part.trim();
+            if !part.is_empty() {
+                if let Ok(v) = header::HeaderValue::from_str(part) {
+                    origins.push(v);
+                }
+            }
+        }
+    }
+
+    // 兜底的本地常用来源（覆盖默认单端口、Vite 开发、双端口发布）
+    let defaults = [
+        "http://localhost:100",
+        "http://127.0.0.1:100",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:8001",
+        "http://127.0.0.1:8001",
+        "http://localhost:8002",
+        "http://127.0.0.1:8002",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ];
+    for o in defaults {
+        if let Ok(v) = header::HeaderValue::from_str(o) {
+            origins.push(v);
+        }
+    }
+
+    AllowOrigin::list(origins)
 }

@@ -200,6 +200,7 @@ watch(
               :src="mediaSrc"
               class="pdf"
               title="PDF 预览"
+              sandbox="allow-same-origin allow-downloads"
             />
             <div v-else class="fallback">
               <span class="emoji">{{ fileIcon(current.file_type, current.name) }}</span>

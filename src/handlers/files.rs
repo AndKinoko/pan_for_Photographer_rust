@@ -213,12 +213,8 @@ pub async fn upload_files(
         })?;
         tokio::fs::rename(&src, &full_path).await?;
 
-        // 已提交，告知守卫勿删（临时文件已被重命名走）
-        let mut guard = pu.guard;
-        guard.path = None;
-
         // 先写库（preview_path/thumb_path = NULL），缩略图在后台异步补齐
-        let file_record = sqlx::query_as::<_, File>(
+        let insert = sqlx::query_as::<_, File>(
             r#"INSERT INTO files (name, original_name, stored_path, preview_path, thumb_path, owner_id, folder_id, size, file_type)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *"#,
         )
@@ -232,7 +228,21 @@ pub async fn upload_files(
         .bind(pu.size)
         .bind(&pu.ext)
         .fetch_one(&pool)
-        .await?;
+        .await;
+
+        let file_record = match insert {
+            Ok(r) => r,
+            Err(e) => {
+                // DB 写入失败：删除刚重命名的物理文件，避免产生无记录孤儿文件；
+                // 若本步也失败，则交由周期 GC（sweeper）兜底清理。
+                let _ = tokio::fs::remove_file(&full_path).await;
+                return Err(e.into());
+            }
+        };
+
+        // DB 写入成功后才标记守卫勿删，避免 Drop 误删已提交文件
+        let mut guard = pu.guard;
+        guard.path = None;
 
         // 后台生成预览图 + 缩略图（spawn_blocking 包裹同步图像处理 + 信号量限并发）
         if file_service::supports_preview(&pu.ext) {
@@ -441,6 +451,7 @@ pub async fn serve_media(
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, mime.as_ref())
+                    .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
                     .body(body)
                     .map_err(|_| AppError::Internal("响应构建失败".into()))?);
             }
@@ -467,6 +478,8 @@ pub async fn serve_media(
             header::CONTENT_DISPOSITION,
             format!("inline; filename=\"{}\"", file.original_name),
         )
+        // 防止响应内容被嗅探成 text/html，堵塞预览相关的 MIME 混淆 XSS
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(body)
         .map_err(|_| AppError::Internal("响应构建失败".into()))?)
 }

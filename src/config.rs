@@ -44,14 +44,22 @@ impl Config {
         // 从文件读取 JWT 密钥；如果缺失则 panic
         let jwt_secret_key_file = std::env::var("JWT_SECRET_KEY_FILE")
             .unwrap_or_else(|_| "./.secret_key".into());
-        let jwt_secret = std::fs::read_to_string(&jwt_secret_key_file)
+        let jwt_secret_str = std::fs::read_to_string(&jwt_secret_key_file)
             .unwrap_or_else(|_| panic!(
                 "在 '{}' 未找到 JWT 密钥文件。请创建一个包含安全随机字符串的文件。",
                 jwt_secret_key_file
             ))
             .trim()
-            .as_bytes()
-            .to_vec();
+            .to_string();
+        if jwt_secret_str.len() < 32 {
+            panic!(
+                "JWT 密钥强度不足：'{}' 内容需至少 32 字节的非空安全随机串，当前仅 {} 字节。\n\
+                 请使用 `openssl rand -base64 48` 生成并写入该文件。",
+                jwt_secret_key_file,
+                jwt_secret_str.len()
+            );
+        }
+        let jwt_secret = jwt_secret_str.as_bytes().to_vec();
 
         let max_file_size: u64 = std::env::var("MAX_FILE_SIZE")
             .unwrap_or_else(|_| "10737418240".into())

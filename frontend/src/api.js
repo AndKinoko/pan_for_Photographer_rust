@@ -166,8 +166,11 @@ export const getPublicShare = (id) => instance.get(`/api/public/shares/${id}`)
 export const verifySharePassword = (id, password) =>
   instance.post(`/api/public/shares/${id}/verify`, { password })
 
-export const publicShareDownloadUrl = (id) =>
-  `/api/public/shares/${id}/download`
+export const publicShareDownloadUrl = (id, ticket) => {
+  let url = `/api/public/shares/${id}/download`
+  if (ticket) url += `?ticket=${encodeURIComponent(ticket)}`
+  return url
+}
 
 export const publicShareMediaUrl = (id, { thumb = false, preview = false } = {}) => {
   const params = new URLSearchParams()
@@ -213,6 +216,47 @@ export const adminDeleteUser = (id) =>
   instance.delete(`/api/admin/users/${id}`)
 
 export const adminGetStats = () => instance.get('/api/admin/stats')
+
+/* ----- 管理端：用户增改 / 代管文件夹 / 代为上传 ----- */
+
+/** 新建用户；payload: { username, password, role?, expires_at? } */
+export const adminCreateUser = (payload) =>
+  instance.post('/api/admin/users', payload)
+
+/** 更新用户；payload: { username?, password?, role?, expires_at?|null }。
+ *  expires_at 传 null 表示清除有效期；不传则保持不变。 */
+export const adminUpdateUser = (id, payload) =>
+  instance.put(`/api/admin/users/${id}`, payload)
+
+/** 列出某普通用户的文件夹（管理端代查） */
+export const adminListUserFolders = (id, parentId) =>
+  instance.get(`/api/admin/users/${id}/folders`, {
+    params: parentId != null ? { parent_id: parentId } : {},
+  })
+
+/** 为某普通用户新建文件夹 */
+export const adminCreateUserFolder = (id, name, parentId) =>
+  instance.post(`/api/admin/users/${id}/folders`, {
+    name,
+    parent_id: parentId,
+  })
+
+/** 以管理员身份为指定用户上传文件；返回 axios 原始响应以暴露进度。 */
+export const adminUploadToUser = (userId, folderId, file, onUploadProgress) =>
+  instance.post(
+    '/api/files/upload',
+    (() => {
+      const form = new FormData()
+      if (folderId != null && folderId !== '') form.append('folder_id', String(folderId))
+      form.append('user_id', String(userId))
+      form.append('file', file, file.name)
+      return form
+    })(),
+    {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      onUploadProgress,
+    }
+  )
 
 /* ===========================================================================
    Health API

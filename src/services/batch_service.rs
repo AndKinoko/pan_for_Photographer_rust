@@ -157,6 +157,10 @@ pub async fn batch_move(
         rows.into_iter().map(|(n,)| n).collect::<HashSet<String>>()
     };
 
+    // 开启事务，保证整批移动要么全部生效、要么全部回滚。
+    // SQLite 为单写者，事务内逐条 UPDATE 串行执行即可。
+    let mut tx = pool.begin().await?;
+
     let mut results = Vec::new();
     let mut succeeded = 0;
     let mut skipped = 0;
@@ -165,9 +169,14 @@ pub async fn batch_move(
 
     // 处理文件
     for &file_id in &req.file_ids {
-        let file = match file_service::get_file_by_id(pool, file_id).await {
-            Ok(f) => f,
-            Err(_) => {
+        let file: Option<File> = sqlx::query_as("SELECT * FROM files WHERE id = ?")
+            .bind(file_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+        let file = match file {
+            Some(f) => f,
+            None => {
                 failed += 1;
                 results.push(BatchItemResult {
                     id: file_id,
@@ -200,27 +209,36 @@ pub async fn batch_move(
                     continue;
                 }
                 "overwrite" => {
-                    // 删除目标中已存在的文件
+                    // 排除自身（原地移动时目标即自身），其余同名目标做软删除，
+                    // 保留在回收站可恢复，避免不可逆的数据丢失。
                     let target_file: Option<(i64,)> = if let Some(tfid) = req.target_folder_id {
                         sqlx::query_as(
-                            "SELECT id FROM files WHERE original_name = ? AND folder_id = ? AND owner_id = ?",
+                            "SELECT id FROM files WHERE original_name = ? AND folder_id = ? AND owner_id = ? AND id != ?",
                         )
                         .bind(&original_name)
                         .bind(tfid)
                         .bind(user_id)
-                        .fetch_optional(pool)
+                        .bind(file_id)
+                        .fetch_optional(&mut *tx)
                         .await?
                     } else {
                         sqlx::query_as(
-                            "SELECT id FROM files WHERE original_name = ? AND folder_id IS NULL AND owner_id = ?",
+                            "SELECT id FROM files WHERE original_name = ? AND folder_id IS NULL AND owner_id = ? AND id != ?",
                         )
                         .bind(&original_name)
                         .bind(user_id)
-                        .fetch_optional(pool)
+                        .bind(file_id)
+                        .fetch_optional(&mut *tx)
                         .await?
                     };
                     if let Some((tid,)) = target_file {
-                        let _ = file_service::delete_file(pool, tid, user_id).await;
+                        sqlx::query(
+                            "UPDATE files SET deleted_at = datetime('now') WHERE id = ? AND owner_id = ? AND deleted_at IS NULL",
+                        )
+                        .bind(tid)
+                        .bind(user_id)
+                        .execute(&mut *tx)
+                        .await?;
                     }
                     current_names.remove(&original_name);
                 }
@@ -232,7 +250,7 @@ pub async fn batch_move(
                         .bind(&new_name)
                         .bind(req.target_folder_id)
                         .bind(file_id)
-                        .execute(pool)
+                        .execute(&mut *tx)
                         .await?;
                     succeeded += 1;
                     results.push(BatchItemResult {
@@ -253,7 +271,7 @@ pub async fn batch_move(
         sqlx::query("UPDATE files SET folder_id = ? WHERE id = ?")
             .bind(req.target_folder_id)
             .bind(file_id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
         current_names.insert(original_name.clone());
         succeeded += 1;
@@ -270,13 +288,13 @@ pub async fn batch_move(
 
     // 处理文件夹
     for &folder_id in &req.folder_ids {
-        let folder: Option<(String,)> =
+        let folder_row: Option<(String,)> =
             sqlx::query_as("SELECT name FROM folders WHERE id = ?")
                 .bind(folder_id)
-                .fetch_optional(pool)
+                .fetch_optional(&mut *tx)
                 .await?;
 
-        let folder_name = match folder {
+        let folder_name = match folder_row {
             Some((n,)) => n,
             None => {
                 failed += 1;
@@ -296,7 +314,7 @@ pub async fn batch_move(
         sqlx::query("UPDATE folders SET parent_id = ? WHERE id = ?")
             .bind(req.target_folder_id)
             .bind(folder_id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
         succeeded += 1;
         results.push(BatchItemResult {
@@ -309,6 +327,8 @@ pub async fn batch_move(
             children_count: None,
         });
     }
+
+    tx.commit().await?;
 
     Ok(BatchMoveCopyResult {
         total: total_items,
@@ -352,6 +372,19 @@ pub async fn batch_copy(
         }
     }
 
+    // 防止复制到自身的子文件夹中：若目标位于任一被复制文件夹的子树内，
+    // BFS 会对已复制的内容再次复制，产生指数级重复记录并耗尽磁盘/空间。
+    if !req.folder_ids.is_empty() {
+        if let Some(tfid) = req.target_folder_id {
+            let subtree = collect_subtree_folder_ids(pool, &req.folder_ids).await?;
+            if subtree.contains(&tfid) {
+                return Err(AppError::BadRequest(
+                    "不能复制到自身或其子文件夹中".into(),
+                ));
+            }
+        }
+    }
+
     // 收集目标中的现有名称
     let existing_names = if let Some(tfid) = req.target_folder_id {
         let rows: Vec<(String,)> = sqlx::query_as(
@@ -392,6 +425,9 @@ pub async fn batch_copy(
         rows.into_iter().map(|(n,)| n).collect::<HashSet<String>>()
     };
 
+    // 开启事务，保证整批复制要么全部落库、要么全部回滚（避免残留半套副本）。
+    let mut tx = pool.begin().await?;
+
     let mut results = Vec::new();
     let mut succeeded = 0;
     let mut skipped = 0;
@@ -400,9 +436,14 @@ pub async fn batch_copy(
     let mut target_folder_names = existing_folder_names;
 
     for &file_id in &req.file_ids {
-        let file = match file_service::get_file_by_id(pool, file_id).await {
-            Ok(f) => f,
-            Err(_) => {
+        let file: Option<File> = sqlx::query_as("SELECT * FROM files WHERE id = ? AND deleted_at IS NULL")
+            .bind(file_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+        let file = match file {
+            Some(f) => f,
+            None => {
                 failed += 1;
                 results.push(BatchItemResult {
                     id: file_id,
@@ -436,26 +477,33 @@ pub async fn batch_copy(
                     continue;
                 }
                 "overwrite" => {
+                    // 目标同名文件软删除，保留在回收站可恢复
                     let target_file: Option<(i64,)> = if let Some(tfid) = req.target_folder_id {
                         sqlx::query_as(
-                            "SELECT id FROM files WHERE original_name = ? AND folder_id = ? AND owner_id = ?",
+                            "SELECT id FROM files WHERE original_name = ? AND folder_id = ? AND owner_id = ? AND deleted_at IS NULL",
                         )
                         .bind(&original_name)
                         .bind(tfid)
                         .bind(user_id)
-                        .fetch_optional(pool)
+                        .fetch_optional(&mut *tx)
                         .await?
                     } else {
                         sqlx::query_as(
-                            "SELECT id FROM files WHERE original_name = ? AND folder_id IS NULL AND owner_id = ?",
+                            "SELECT id FROM files WHERE original_name = ? AND folder_id IS NULL AND owner_id = ? AND deleted_at IS NULL",
                         )
                         .bind(&original_name)
                         .bind(user_id)
-                        .fetch_optional(pool)
+                        .fetch_optional(&mut *tx)
                         .await?
                     };
                     if let Some((tid,)) = target_file {
-                        let _ = file_service::delete_file(pool, tid, user_id).await;
+                        sqlx::query(
+                            "UPDATE files SET deleted_at = datetime('now') WHERE id = ? AND owner_id = ? AND deleted_at IS NULL",
+                        )
+                        .bind(tid)
+                        .bind(user_id)
+                        .execute(&mut *tx)
+                        .await?;
                     }
                     current_names.remove(&original_name);
                 }
@@ -478,7 +526,7 @@ pub async fn batch_copy(
         .bind(req.target_folder_id)
         .bind(file.size)
         .bind(&file.file_type)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
         current_names.insert(new_name.clone());
@@ -500,7 +548,7 @@ pub async fn batch_copy(
         let folder: Option<(String,)> =
             sqlx::query_as("SELECT name FROM folders WHERE id = ? AND deleted_at IS NULL")
                 .bind(folder_id)
-                .fetch_optional(pool)
+                .fetch_optional(&mut *tx)
                 .await?;
 
         let folder_name = match folder {
@@ -536,7 +584,7 @@ pub async fn batch_copy(
         .bind(&new_folder_name)
         .bind(user_id)
         .bind(req.target_folder_id)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
 
         target_folder_names.insert(new_folder_name.clone());
@@ -556,7 +604,7 @@ pub async fn batch_copy(
                 "SELECT * FROM files WHERE folder_id = ? AND deleted_at IS NULL",
             )
             .bind(src_id)
-            .fetch_all(pool)
+            .fetch_all(&mut *tx)
             .await?;
 
             for f in files {
@@ -576,7 +624,7 @@ pub async fn batch_copy(
                 .bind(dst_id)
                 .bind(f.size)
                 .bind(&f.file_type)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
                 dst_names.insert(file_name);
                 children_count += 1;
@@ -587,7 +635,7 @@ pub async fn batch_copy(
                 "SELECT id, name FROM folders WHERE parent_id = ? AND deleted_at IS NULL",
             )
             .bind(src_id)
-            .fetch_all(pool)
+            .fetch_all(&mut *tx)
             .await?;
 
             for (sub_id, sub_name) in subfolders {
@@ -601,7 +649,7 @@ pub async fn batch_copy(
                 .bind(&new_sub_name)
                 .bind(user_id)
                 .bind(dst_id)
-                .fetch_one(pool)
+                .fetch_one(&mut *tx)
                 .await?;
                 dst_names.insert(new_sub_name);
                 queue.push_back((sub_id, new_sub_id));
@@ -624,6 +672,8 @@ pub async fn batch_copy(
             children_count: Some(children_count),
         });
     }
+
+    tx.commit().await?;
 
     Ok(BatchMoveCopyResult {
         total: total_items,
