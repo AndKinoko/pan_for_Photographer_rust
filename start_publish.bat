@@ -6,7 +6,7 @@ echo ============================================================
 echo   Photographer Netdisk - Dual-port Launcher
 echo ------------------------------------------------------------
 echo   [8001] Normal User Frontend : login / browse / preview / download
-echo   [8002] Admin Frontend       : super admin AKIHANA manage users
+echo   [8002] Admin Frontend       : super admin (via SEED_ADMIN_USERNAME env)
 echo                                (expiry, password, batch upload orig)
 echo ============================================================
 echo.
@@ -31,6 +31,6 @@ echo.
 echo  Launch commands sent. Two service windows are opening ...
 echo    Normal user : http://localhost:8001
 echo    Admin       : http://localhost:8002
-echo    Super admin : AKIHANA / ljyljy
+echo    Super admin : 由 SEED_ADMIN_USERNAME / SEED_ADMIN_PASSWORD 环境变量控制（首次启动时设置）
 echo.
 pause

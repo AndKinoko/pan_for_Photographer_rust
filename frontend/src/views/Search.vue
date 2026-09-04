@@ -3,18 +3,19 @@ import { ref, reactive, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   searchFiles,
-  authUrl,
   renameFile,
   deleteFile,
 } from '../api'
 import { useToast } from '../composables/useToast'
 import { confirm } from '../composables/useConfirm'
+import { useTransfer } from '../composables/useTransfer'
 import FileCard from '../components/FileCard.vue'
 import FilePreview from '../components/FilePreview.vue'
 import ShareDialog from '../components/ShareDialog.vue'
 
 const router = useRouter()
 const toast = useToast()
+const transfer = useTransfer()
 
 const q = ref('')
 const filters = reactive({
@@ -93,12 +94,8 @@ function onFolderClick(folder) {
 }
 
 function downloadFile(file) {
-  const a = document.createElement('a')
-  a.href = authUrl(file.download_url)
-  a.download = file.name
-  document.body.appendChild(a)
-  a.click()
-  a.remove()
+  // 下载进入全局下载队列（抽屉内实时进度）
+  transfer.enqueueDownload({ filename: file.name, url: file.download_url, authed: true })
 }
 
 async function onRename(file) {

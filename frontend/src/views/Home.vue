@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   listFiles,
@@ -12,10 +12,10 @@ import {
   batchMove,
   batchCopy,
   batchDelete,
-  authUrl,
 } from '../api'
 import { useToast } from '../composables/useToast'
 import { confirm } from '../composables/useConfirm'
+import { useTransfer } from '../composables/useTransfer'
 import FileCard from '../components/FileCard.vue'
 import FilePreview from '../components/FilePreview.vue'
 import UploadZone from '../components/UploadZone.vue'
@@ -26,6 +26,7 @@ import Breadcrumb from '../components/Breadcrumb.vue'
 const route = useRoute()
 const router = useRouter()
 const toast = useToast()
+const transfer = useTransfer()
 
 /* ----------------------------- Folder context ---------------------------- */
 const breadcrumb = ref([]) // [{ id, name }]; empty = root
@@ -68,6 +69,8 @@ function navigateTo(item) {
 async function load() {
   loading.value = true
   errorMsg.value = ''
+  // 重新加载列表时丢弃全选快照（item id 集合已变）
+  preSelectAllSnapshot.value = null
   try {
     const [f, d] = await Promise.all([
       listFiles(currentFolderId.value),
@@ -102,14 +105,70 @@ function toggleSelect(item, kind) {
   // Trigger reactivity for Set mutations
   selectedFiles.value = new Set(selectedFiles.value)
   selectedFolders.value = new Set(selectedFolders.value)
+  // 主动修改选择后，快照失效（避免撤销全选时回到过期状态）
+  preSelectAllSnapshot.value = null
 }
 function clearSelection() {
   selectedFiles.value = new Set()
   selectedFolders.value = new Set()
+  preSelectAllSnapshot.value = null // 清空时也丢弃快照
 }
 function selectAll() {
   selectedFiles.value = new Set(files.value.map((f) => f.id))
   selectedFolders.value = new Set(folders.value.map((f) => f.id))
+}
+
+/** 点击"全选"之前已选中的项的快照；
+ *  当用户再点"已全选"时，恢复到该快照，而不是清空。 */
+const preSelectAllSnapshot = ref(null)
+
+/** 当前文件夹下所有可选项（文件 + 文件夹）数量 */
+const selectableCount = computed(
+  () => files.value.length + folders.value.length
+)
+/** 是否已全选当前文件夹下所有可选项 */
+const isAllSelected = computed(
+  () =>
+    selectableCount.value > 0 &&
+    selectedCount.value === selectableCount.value
+)
+
+/** 全选按钮：
+ *  - 当前未全选：保存当前选中 → 全选
+ *  - 当前已全选：恢复到点击全选前的快照（而不是清空）
+ *  若从未有过快照（例如首次进入已是全选态），则按 clearSelection 处理。 */
+function onSelectAll() {
+  if (isAllSelected.value) {
+    if (preSelectAllSnapshot.value) {
+      selectedFiles.value = new Set(preSelectAllSnapshot.value.files)
+      selectedFolders.value = new Set(preSelectAllSnapshot.value.folders)
+    } else {
+      clearSelection()
+    }
+    preSelectAllSnapshot.value = null
+  } else {
+    // 拍下点击全选之前的快照
+    preSelectAllSnapshot.value = {
+      files: Array.from(selectedFiles.value),
+      folders: Array.from(selectedFolders.value),
+    }
+    selectAll()
+  }
+}
+/** 反选：在当前列表中，已选中的取消、未选中的选中。
+ *  不影响跨文件夹的子项选择（其他文件夹的 item 不在 files/folders 里）。 */
+function onInvert() {
+  const nextFiles = new Set()
+  for (const f of files.value) {
+    if (!selectedFiles.value.has(f.id)) nextFiles.add(f.id)
+  }
+  const nextFolders = new Set()
+  for (const f of folders.value) {
+    if (!selectedFolders.value.has(f.id)) nextFolders.add(f.id)
+  }
+  selectedFiles.value = nextFiles
+  selectedFolders.value = nextFolders
+  preSelectAllSnapshot.value = null // 反选后快照失效
 }
 
 /* ----------------------------- Preview ----------------------------------- */
@@ -126,12 +185,27 @@ function onCardClick(item, kind) {
 }
 
 function downloadFile(file) {
-  const a = document.createElement('a')
-  a.href = authUrl(file.download_url)
-  a.download = file.name
-  document.body.appendChild(a)
-  a.click()
-  a.remove()
+  // 下载进入全局下载队列（抽屉内实时进度）
+  transfer.enqueueDownload({ filename: file.name, url: file.download_url, authed: true })
+}
+
+function onBatchDownload() {
+  const ids = Array.from(selectedFiles.value)
+  if (!ids.length) return
+  // 按当前列表顺序取文件，逐个入队（抽屉内独立进度）
+  const set = new Set(ids)
+  const targets = files.value.filter((f) => set.has(f.id))
+  if (!targets.length) return
+  for (const f of targets) {
+    transfer.enqueueDownload({
+      filename: f.name,
+      url: f.download_url,
+      authed: true,
+    })
+  }
+  // 自动打开抽屉并切到下载 tab，让用户直接看到进度
+  transfer.openDrawer('download')
+  // 不清空选择：用户可能想接着做别的
 }
 
 async function onRename(item, kind) {
@@ -176,23 +250,78 @@ async function onRemove(item, kind) {
 }
 
 /* ----------------------------- Upload ------------------------------------ */
+/* 上传入口保留在页面（dropzone），进度统一在「传输」抽屉查看 */
 const uploadRef = ref(null)
 const showUpload = ref(true)
-function onUploaded(fileInfo) {
-  if (!files.value.some((f) => f.id === fileInfo.id)) {
-    files.value = [fileInfo, ...files.value]
-  }
-}
-function onAllDone() {
-  /* keep queue visible; parent already appended items */
-}
 function onGridDrop(e) {
   const dropped = e.dataTransfer?.files
   if (dropped && dropped.length) {
-    uploadRef.value?.addFiles(dropped)
+    // 直接进入全局队列（不依赖 UploadZone 实例，避免其未挂载时空指针）
+    transfer.enqueueUpload(dropped, currentFolderId.value)
     showUpload.value = true
   }
 }
+
+// 上传完成后：把文件插进当前目录列表；若是图片则轮询补齐后台生成的缩略图
+let uploadPendingIds = new Set()
+let uploadPoller = null
+let clearUploadCb = null
+
+function matchesCurrentFolder(folderId) {
+  const cur = currentFolderId.value
+  return folderId == null ? cur == null : folderId === cur
+}
+
+function startThumbPolling() {
+  if (uploadPoller || !uploadPendingIds.size) return
+  const deadline = Date.now() + 15000 // 兜底超时，避免无限轮询
+  uploadPoller = setInterval(async () => {
+    try {
+      const list = (await listFiles(currentFolderId.value)) || []
+      const map = new Map(list.map((f) => [f.id, f]))
+      for (const id of Array.from(uploadPendingIds)) {
+        const nf = map.get(id)
+        if (nf && nf.preview_url) {
+          const cur = files.value.find((f) => f.id === id)
+          if (cur) {
+            cur.preview_url = nf.preview_url
+            cur.thumb_url = nf.thumb_url
+            cur.has_preview = nf.has_preview
+          }
+          uploadPendingIds.delete(id)
+        }
+      }
+    } catch {
+      /* 单次查询失败则下一轮继续 */
+    }
+    if (!uploadPendingIds.size || Date.now() > deadline) {
+      clearInterval(uploadPoller)
+      uploadPoller = null
+      uploadPendingIds = new Set()
+    }
+  }, 800)
+}
+
+function onGlobalUploadComplete({ fileId, folderId, name, isImage }) {
+  // 仅处理属于当前目录的上传
+  if (!matchesCurrentFolder(folderId)) return
+  if (isImage && fileId != null) {
+    uploadPendingIds.add(fileId)
+    startThumbPolling()
+  }
+  load()
+}
+
+onMounted(() => {
+  clearUploadCb = transfer.onUploadComplete(onGlobalUploadComplete)
+})
+onBeforeUnmount(() => {
+  clearUploadCb && clearUploadCb()
+  if (uploadPoller) {
+    clearInterval(uploadPoller)
+    uploadPoller = null
+  }
+})
 
 /* ----------------------------- New folder -------------------------------- */
 const showNewFolder = ref(false)
@@ -393,8 +522,6 @@ onMounted(() => {
       ref="uploadRef"
       :folder-id="currentFolderId"
       compact
-      @uploaded="onUploaded"
-      @all-done="onAllDone"
     />
 
     <!-- Loading -->
@@ -562,11 +689,16 @@ onMounted(() => {
       :selected-count="selectedCount"
       :file-selected-count="selectedFiles.size"
       :folder-selected-count="selectedFolders.size"
+      :selectable-count="selectableCount"
+      :is-all-selected="isAllSelected"
       @move="openMoveCopy('move')"
       @copy="openMoveCopy('copy')"
       @delete="onBatchDelete"
       @share="openBatchShare"
+      @download="onBatchDownload"
       @clear="clearSelection"
+      @select-all="onSelectAll"
+      @invert="onInvert"
     />
   </div>
 </template>

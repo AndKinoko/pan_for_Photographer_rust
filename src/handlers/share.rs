@@ -159,6 +159,7 @@ pub async fn public_share_download(
     share_service::increment_download_count(&pool, &share_id).await?;
 
     let file_handle = tokio::fs::File::open(&full_path).await?;
+    let file_size = file_handle.metadata().await.map(|m| m.len()).unwrap_or(0);
     let stream = ReaderStream::new(file_handle);
     let body = Body::from_stream(stream);
     let mime = mime_guess::from_path(&file.original_name)
@@ -171,6 +172,8 @@ pub async fn public_share_download(
             header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"{}\"", file.original_name),
         )
+        // 让前端能拿到 total 走真实进度
+        .header(header::CONTENT_LENGTH, file_size)
         .body(body)
         .map_err(|_| AppError::Internal("响应构建失败".into()))?)
 }

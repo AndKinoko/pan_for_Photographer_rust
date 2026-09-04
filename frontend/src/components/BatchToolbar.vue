@@ -3,8 +3,21 @@ defineProps({
   selectedCount: { type: Number, default: 0 },
   fileSelectedCount: { type: Number, default: 0 },
   folderSelectedCount: { type: Number, default: 0 },
+  // 当前文件夹下的可选总数（文件 + 文件夹），用于全选状态判定
+  selectableCount: { type: Number, default: 0 },
+  // 是否已全部选中
+  isAllSelected: { type: Boolean, default: false },
 })
-const emit = defineEmits(['move', 'copy', 'delete', 'share', 'clear'])
+const emit = defineEmits([
+  'move',
+  'copy',
+  'delete',
+  'share',
+  'download',
+  'clear',
+  'select-all',
+  'invert',
+])
 </script>
 
 <template>
@@ -12,6 +25,21 @@ const emit = defineEmits(['move', 'copy', 'delete', 'share', 'clear'])
     <div v-if="selectedCount > 0" class="batch-bar">
       <div class="left">
         <span class="count">已选 {{ selectedCount }} 项</span>
+        <button
+          class="btn btn-sm btn-ghost"
+          :title="isAllSelected ? '取消全选' : '全选当前文件夹下的所有文件和文件夹'"
+          @click="emit('select-all')"
+        >
+          {{ isAllSelected ? '☑️ 已全选' : '☐ 全选' }}
+        </button>
+        <button
+          v-if="selectableCount > 0 && selectedCount > 0 && !isAllSelected"
+          class="btn btn-sm btn-ghost"
+          title="反选（已选中的取消，未选中的选中）"
+          @click="emit('invert')"
+        >
+          🔁 反选
+        </button>
         <button class="btn btn-sm btn-ghost" @click="emit('clear')">
           取消选择
         </button>
@@ -29,6 +57,13 @@ const emit = defineEmits(['move', 'copy', 'delete', 'share', 'clear'])
           @click="emit('share')"
         >
           🔗 分享
+        </button>
+        <button
+          v-if="fileSelectedCount > 0"
+          class="btn btn-sm"
+          @click="emit('download')"
+        >
+          ⬇️ 下载
         </button>
         <button class="btn btn-sm btn-danger" @click="emit('delete')">
           🗑️ 删除
@@ -49,7 +84,7 @@ const emit = defineEmits(['move', 'copy', 'delete', 'share', 'clear'])
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  width: min(94vw, 720px);
+  width: min(94vw, 800px);
   padding: 10px 14px;
   background: var(--bg-elevated);
   border: 1px solid var(--border);

@@ -458,7 +458,7 @@ els.loginForm.addEventListener('submit', async (e) => {
     const me = await api('/api/auth/me')
     if (!me || me.role !== 'admin') {
       localStorage.removeItem(TOKEN_KEY)
-      throw new Error('该账号不是管理员，请使用超级管理员（AKIHANA）登录')
+      throw new Error('该账号不是管理员，请使用具备管理员权限的账户登录')
     }
     state.user = me
     toast('登录成功')

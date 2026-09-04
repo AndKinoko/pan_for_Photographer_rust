@@ -158,11 +158,39 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-/// 确保超级管理员 AKIHANA 存在（幂等）。仅首次创建，不覆盖已存在的密码/角色。
+/// 确保超级管理员存在（幂等）。仅首次创建，不覆盖已存在的密码/角色。
+///
+/// 账号与初始密码从环境变量读取，避免硬编码在源码中泄露：
+///   - `SEED_ADMIN_USERNAME`：默认 `"admin"`
+///   - `SEED_ADMIN_PASSWORD`：默认空；若为空则**仅在数据库尚无任何 admin 时**打印警告并跳过创建，
+///     由首个启动者通过 `cargo run -- admin create` 或数据库直接操作完成初始化。
 pub async fn seed_admin(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    let username = "AKIHANA";
-    let password = "ljyljy";
-    let password_hash = crate::utils::crypto::hash_password(password)
+    let username =
+        std::env::var("SEED_ADMIN_USERNAME").unwrap_or_else(|_| "admin".to_string());
+    let password = std::env::var("SEED_ADMIN_PASSWORD").unwrap_or_default();
+
+    // 仅在数据库里"完全没有 admin"时尝试创建；已存在则什么都不做（保证幂等、不覆盖）。
+    let admin_exists: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
+            .fetch_optional(pool)
+            .await?;
+    if admin_exists.is_some() {
+        tracing::info!("已存在 admin 账户，跳过种子创建");
+        return Ok(());
+    }
+
+    if password.is_empty() {
+        tracing::warn!(
+            "数据库中无 admin 账户，且未设置 SEED_ADMIN_PASSWORD。\n\
+             请通过以下方式之一初始化第一个管理员：\n\
+             1. 设置 SEED_ADMIN_USERNAME / SEED_ADMIN_PASSWORD 环境变量后重启；\n\
+             2. 手动 INSERT 一个 admin 账户；\n\
+             3. 调用 /api/auth/register 注册后由数据库手动 UPDATE role='admin'。"
+        );
+        return Ok(());
+    }
+
+    let password_hash = crate::utils::crypto::hash_password(&password)
         .map_err(|_| sqlx::Error::ColumnIndexOutOfBounds { index: 0, len: 1 })?;
 
     sqlx::query(
@@ -170,11 +198,11 @@ pub async fn seed_admin(pool: &SqlitePool) -> Result<(), sqlx::Error> {
            VALUES (?, ?, 'admin')
            ON CONFLICT(username) DO NOTHING"#,
     )
-    .bind(username)
+    .bind(&username)
     .bind(&password_hash)
     .execute(pool)
     .await?;
 
-    tracing::info!("超级管理员 AKIHANA 已就绪");
+    tracing::info!("已创建 admin 账户 '{}'，请尽快登录后修改密码", username);
     Ok(())
 }

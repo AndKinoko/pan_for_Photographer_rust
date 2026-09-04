@@ -11,10 +11,12 @@ import {
 } from '../api'
 import { useToast } from '../composables/useToast'
 import { useTheme } from '../composables/useTheme'
+import { useTransfer } from '../composables/useTransfer'
 
 const route = useRoute()
 const toast = useToast()
 const { theme, toggle: toggleTheme } = useTheme()
+const transfer = useTransfer()
 
 const share = ref(null)
 const loading = ref(true)
@@ -42,9 +44,15 @@ const isAudio = computed(() =>
 const isPdf = computed(() => share.value?.file_type?.toLowerCase() === 'pdf')
 const isFolder = computed(() => share.value?.file_type === 'folder')
 
-const downloadHref = computed(() =>
-  share.value ? publicShareDownloadUrl(share.value.id) : '#'
-)
+function downloadShared() {
+  if (!share.value) return
+  // 下载进入全局下载队列（公开无 token）
+  transfer.enqueueDownload({
+    filename: share.value.file_name,
+    url: publicShareDownloadUrl(share.value.id),
+    authed: false,
+  })
+}
 
 const canShowMedia = computed(() => {
   if (!share.value) return false
@@ -207,14 +215,13 @@ onMounted(load)
       </div>
 
       <div class="actions">
-        <a
+        <button
           v-if="!isFolder"
           class="btn btn-primary download"
-          :href="downloadHref"
-          :download="share.file_name"
+          @click="downloadShared"
         >
           ⬇️ 下载文件
-        </a>
+        </button>
         <span v-else class="muted">文件夹暂不支持打包下载</span>
       </div>
     </div>

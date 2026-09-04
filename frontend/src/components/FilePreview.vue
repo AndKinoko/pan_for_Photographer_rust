@@ -1,6 +1,9 @@
 <script setup>
 import { computed, watch, ref, onMounted, onBeforeUnmount } from 'vue'
 import { authUrl, fileIcon, formatSize, formatDate, isImageFile } from '../api'
+import { useTransfer } from '../composables/useTransfer'
+
+const transfer = useTransfer()
 
 const props = defineProps({
   visible: { type: Boolean, default: false },
@@ -34,10 +37,16 @@ const mediaSrc = computed(() => {
   const url = current.value.preview_url || current.value.media_url
   return authUrl(url)
 })
-const downloadHref = computed(() => {
-  if (!current.value) return ''
-  return authUrl(current.value.download_url)
-})
+
+function downloadCurrent() {
+  if (!current.value) return
+  // 下载进入全局下载队列（抽屉内实时进度）
+  transfer.enqueueDownload({
+    filename: current.value.name,
+    url: current.value.download_url,
+    authed: true,
+  })
+}
 
 const imgLoaded = ref(false)
 const imgError = ref(false)
@@ -95,8 +104,8 @@ watch(
             <span class="counter muted">{{ index + 1 }} / {{ files.length }}</span>
             <a
               class="btn btn-sm btn-ghost"
-              :href="downloadHref"
-              :download="current.name"
+              href="#"
+              @click.prevent="downloadCurrent"
             >
               ⬇️ 下载
             </a>
@@ -139,8 +148,8 @@ watch(
                 <p>预览加载失败</p>
                 <a
                   class="btn btn-primary btn-sm"
-                  :href="downloadHref"
-                  :download="current.name"
+                  href="#"
+                  @click.prevent="downloadCurrent"
                 >
                   ⬇️ 下载文件
                 </a>
@@ -159,8 +168,8 @@ watch(
                 <p>视频预览加载失败</p>
                 <a
                   class="btn btn-primary btn-sm"
-                  :href="downloadHref"
-                  :download="current.name"
+                  href="#"
+                  @click.prevent="downloadCurrent"
                 >
                   ⬇️ 下载文件
                 </a>
@@ -179,8 +188,8 @@ watch(
                 <p>音频预览加载失败</p>
                 <a
                   class="btn btn-primary btn-sm"
-                  :href="downloadHref"
-                  :download="current.name"
+                  href="#"
+                  @click.prevent="downloadCurrent"
                 >
                   ⬇️ 下载文件
                 </a>

@@ -334,6 +334,7 @@ pub async fn download_file(
     }
 
     let file_handle = tokio::fs::File::open(&full_path).await?;
+    let file_size = file_handle.metadata().await.map(|m| m.len()).unwrap_or(0);
     let stream = ReaderStream::new(file_handle);
     let body = Body::from_stream(stream);
     let mime = mime_guess::from_path(&file.original_name)
@@ -346,6 +347,8 @@ pub async fn download_file(
             header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"{}\"", file.original_name),
         )
+        // 显式声明 Content-Length，前端 fetch/axios 才能拿到 total 走真实进度
+        .header(header::CONTENT_LENGTH, file_size)
         .body(body)
         .map_err(|_| AppError::Internal("响应构建失败".into()))?;
 

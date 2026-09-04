@@ -4,13 +4,20 @@ import { useRoute, useRouter, RouterView } from 'vue-router'
 import { getMe } from './api'
 import { useTheme } from './composables/useTheme'
 import { useToast } from './composables/useToast'
+import { useTransfer } from './composables/useTransfer'
 import Toast from './components/Toast.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
+import TransferDrawer from './components/TransferDrawer.vue'
 
 const route = useRoute()
 const router = useRouter()
 const toast = useToast()
 const { theme, toggle: toggleTheme } = useTheme()
+const transfer = useTransfer()
+
+const activeTransferCount = computed(
+  () => transfer.uploadActiveCount.value + transfer.downloadActiveCount.value
+)
 
 const user = ref(null)
 const loadingUser = ref(true)
@@ -108,6 +115,17 @@ router.afterEach(() => {
             <span class="nav-icon">{{ item.icon }}</span>
             <span>{{ item.label }}</span>
           </RouterLink>
+          <!-- 传输抽屉入口（非路由，点击弹出上传/下载队列） -->
+          <button
+            class="nav-item transfer-entry"
+            @click="transfer.openDrawer('upload')"
+          >
+            <span class="nav-icon"> 📦 </span>
+            <span>传输</span>
+            <span v-if="activeTransferCount" class="badge-transfer">
+              {{ activeTransferCount }}
+            </span>
+          </button>
         </nav>
         <div class="sidebar-foot">
           <button class="theme-toggle" @click="toggleTheme">
@@ -164,6 +182,8 @@ router.afterEach(() => {
           <RouterView />
         </main>
       </div>
+
+      <TransferDrawer />
     </div>
 
   <Toast />
@@ -248,10 +268,29 @@ router.afterEach(() => {
   background: var(--primary-soft);
   color: var(--primary);
 }
+.nav-item.transfer-entry {
+  border: none;
+  width: 100%;
+  cursor: pointer;
+}
 .nav-icon {
   font-size: 1.1rem;
   width: 22px;
   text-align: center;
+}
+.badge-transfer {
+  margin-left: auto;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--primary);
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 .sidebar-foot {
   margin-top: 8px;
