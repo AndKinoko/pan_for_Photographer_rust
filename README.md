@@ -41,8 +41,8 @@
 ### 1. 克隆与构建前端
 
 ```bash
-git clone <repo-url> pan_for_Photographer
-cd pan_for_Photographer/frontend
+git clone <repo-url> pan_for_Photographer_rust
+cd pan_for_Photographer_rust/frontend
 npm install
 npm run build       # 输出到 ../static/（已被 .gitignore）
 ```
@@ -201,10 +201,10 @@ pan_for_Photographer/
 | POST | `/api/files/upload` | 上传文件（multipart 流式） |
 | GET  | `/api/files/:id/download` | 下载文件 |
 | GET  | `/api/files/:id/media` | 预览 / 缩略图 / 原图 |
-| DELETE | `/api/files/:id` | 软删除 |
+| 删除 | `/api/files/:id` | 软删除 |
 | POST | `/api/files/:id/restore` | 恢复 |
-| DELETE | `/api/files/:id/permanent` | 永久删除 |
-| DELETE | `/api/trash` | 清空回收站（并触发即时 GC） |
+| 删除 | `/api/files/:id/permanent` | 永久删除 |
+| 删除 | `/api/trash` | 清空回收站（并触发即时 GC） |
 | GET  | `/api/folders` | 文件夹列表 |
 | GET  | `/api/search` | 全局搜索 |
 | GET  | `/api/public/shares/:id` | 公开分享详情 |
