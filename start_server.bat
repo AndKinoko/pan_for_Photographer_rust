@@ -8,8 +8,8 @@ cd /d "%~dp0"
 :: 指定 IPv6 地址：              set SERVER_HOST=2001:db8::1
 :: IPv4 地址：                   set SERVER_HOST=0.0.0.0
 :: ─────────────────────────────────────────────────────────────────
-if not defined SERVER_HOST set SERVER_HOST=::
-if not defined SERVER_PORT set SERVER_PORT=0100
+if not defined SERVER_HOST set SERVER_HOST=0.0.0.0
+if not defined SERVER_PORT set SERVER_PORT=8000
 
 echo SERVER_HOST=%SERVER_HOST%  SERVER_PORT=%SERVER_PORT%
 echo Starting Pan For Photographer...

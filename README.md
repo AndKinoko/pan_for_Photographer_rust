@@ -18,7 +18,9 @@
 - **缩略图异步生成**：后台队列 + 并发闸（permits=2），上传响应毫秒级返回，缩略图自动补齐
 - **磁盘孤儿清理**：周期 GC 对账（孤儿文件 / 超龄 .part / 缺失缩略图重投）
 - **公开分享**：密码保护、过期时间、下载次数限制
-- **用户系统**：注册 / 登录 / JWT，管理员面板管理用户（含账号有效期）
+- **用户配额**：每用户默认 5GB 网盘空间，管理员可按用户调整；用量含回收站，上传在落盘前校验，超限文件整拒绝
+- **用户系统**：注册 / 登录 / JWT，管理员面板管理用户（含账号有效期、配额）
+- **交互细节**：隐形全屏拖放上传（页面任意位置松手即可）、移动端双排顶栏（滚动自动收起）、侧边栏左下角用户信息（用户名 / 容量进度条 / 退出）
 - **主题切换**：亮色 / 暗色
 
 ## 技术栈
@@ -124,7 +126,7 @@ cargo run --release
 管理端功能已并入 Vue 主站（`/admin`），不再需要独立管理前端；普通用户交付端 `static_user/` 保留（供客户只读取片）。
 
 - `8001`：影像交付端（`static_user/`）——客户只读：登录 / 浏览 / 预览 / 下载
-- `0100`：统一 Vue 前端（`static/`）——完整功能 + 管理端（admin 登录后访问 `/admin`：用户管理 / 有效期 / 新建·编辑用户 / 为指定用户上传原图 / 系统统计）
+- `0100`：统一 Vue 前端（`static/`）——完整功能 + 管理端（admin 登录后访问 `/admin`：用户管理 / 有效期 / 配额调整 / 新建·编辑用户 / 为指定用户上传原图 / 系统统计）
 
 > 两端口共用同一数据库与上传目录。超管账号由 `SEED_ADMIN_USERNAME` / `SEED_ADMIN_PASSWORD` 环境变量控制（首次启动时设置）。
 
@@ -187,6 +189,7 @@ pan_for_Photographer/
 > - `.secret_key` — JWT 密钥
 > - `.env`、`.env.local` — 环境变量
 > - `.trae/` — IDE 本地工作目录（含个人规划文档）
+> - `*.nef`、`*.cr2` 等 — 联调用 RAW 原片 / 大图样片
 
 ---
 
@@ -196,7 +199,7 @@ pan_for_Photographer/
 |------|------|------|
 | POST | `/api/auth/register` | 用户注册 |
 | POST | `/api/auth/login` | 用户登录 |
-| GET  | `/api/auth/me` | 当前用户信息 |
+| GET  | `/api/auth/me` | 当前用户信息（含已用容量 used_bytes） |
 | GET  | `/api/files` | 列出当前文件夹文件 |
 | POST | `/api/files/upload` | 上传文件（multipart 流式） |
 | GET  | `/api/files/:id/download` | 下载文件 |
@@ -208,11 +211,13 @@ pan_for_Photographer/
 | GET  | `/api/folders` | 文件夹列表 |
 | GET  | `/api/search` | 全局搜索 |
 | GET  | `/api/public/shares/:id` | 公开分享详情 |
-| GET  | `/api/admin/users` | 管理员用户列表 |
+| GET  | `/api/admin/users` | 管理员用户列表（含各用户配额与用量） |
+| PUT  | `/api/admin/users/:id` | 编辑用户（账号/密码/角色/有效期/配额） |
 
 ## 存储与后台任务说明
 
-- **上传**：multipart 字段以 chunk 流式写入 `uploads/.tmp_incoming/*.part`，完成后原子重命名为 `user_<id>/`，INSERT 数据库后立即响应；超限文件在流内计数阶段即被拒绝（413）。
+- **上传**：multipart 字段以 chunk 流式写入 `uploads/.tmp_incoming/*.part`，完成后原子重命名为 `user_<id>/`，INSERT 数据库后立即响应；超限文件在流内计数阶段即被拒绝（413）。重命名落盘前还会按用户配额校验（`SUM(size)` 含回收站），超出配额的文件整体拒绝并跳过。
+- **配额**：`users.quota_bytes` 列（默认 5GB，列默认值自动覆盖存量用户）；用量口径与校验口径一致——均含回收站，清空回收站即释放空间。
 - **缩略图**：插入时 `preview_path/thumb_path` 为 NULL，后台任务（`spawn_blocking` + 信号量限并发）生成后 UPDATE。生成完成前前端自动轮询补齐。
 - **孤儿清理（GC）**：周期扫描 `uploads/`，对账数据库——孤儿源文件/预览（超 5 分钟）、超龄 `.part`（超 1 小时）会被删除；`preview_path IS NULL` 的图片行自动重新入队补生成。
 

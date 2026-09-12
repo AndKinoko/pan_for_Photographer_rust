@@ -106,6 +106,14 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .await
         .ok();
 
+    // 用户网盘配额（字节，默认 5GB）
+    sqlx::query(
+        "ALTER TABLE users ADD COLUMN quota_bytes INTEGER NOT NULL DEFAULT 5368709120",
+    )
+    .execute(pool)
+    .await
+    .ok();
+
     // 文件软删除
     sqlx::query("ALTER TABLE files ADD COLUMN deleted_at DATETIME")
         .execute(pool)

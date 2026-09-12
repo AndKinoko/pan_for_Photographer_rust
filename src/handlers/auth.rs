@@ -114,9 +114,21 @@ pub async fn me(
         .await?
         .ok_or_else(|| AppError::NotFound("用户不存在".into()))?;
 
+    // 已用容量（含回收站，与配额校验口径一致），供前端展示
+    let (used_bytes,): (i64,) =
+        sqlx::query_as("SELECT COALESCE(SUM(size), 0) FROM files WHERE owner_id = ?")
+            .bind(user.id)
+            .fetch_one(&pool)
+            .await?;
+
+    let mut data = serde_json::to_value(UserInfo::from(user))?;
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert("used_bytes".into(), json!(used_bytes));
+    }
+
     Ok(Json(json!({
         "success": true,
-        "data": UserInfo::from(user),
+        "data": data,
         "error": null
     })))
 }

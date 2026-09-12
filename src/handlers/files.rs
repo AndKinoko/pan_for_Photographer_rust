@@ -192,12 +192,27 @@ pub async fn upload_files(
         auth.user_id
     };
 
+    let (quota_bytes,): (i64,) = sqlx::query_as("SELECT quota_bytes FROM users WHERE id = ?")
+        .bind(owner_id)
+        .fetch_one(&pool)
+        .await?;
+
     // 阶段 2：提交已流式落盘的待处理文件（.part -> rename 原子提交 + INSERT）
     for pu in pending {
         // 重复检查（此时已能确定 owner/folder）
         if file_service::check_duplicates(&pool, owner_id, folder_id, &pu.file_name).await? {
             errors.push(format!("文件 \"{}\" 已存在，已跳过", pu.file_name));
             // pu 的 guard Drop 移除临时 .part
+            continue;
+        }
+
+        let (used,): (i64,) =
+            sqlx::query_as("SELECT COALESCE(SUM(size), 0) FROM files WHERE owner_id = ?")
+                .bind(owner_id)
+                .fetch_one(&pool)
+                .await?;
+        if used + pu.size > quota_bytes {
+            errors.push(format!("文件 \"{}\" 超出网盘配额，已跳过", pu.file_name));
             continue;
         }
 

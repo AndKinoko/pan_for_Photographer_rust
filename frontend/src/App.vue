@@ -1,7 +1,7 @@
 <script setup>
-import { ref, computed, onMounted, watch, provide } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch, provide } from 'vue'
 import { useRoute, useRouter, RouterView } from 'vue-router'
-import { getMe } from './api'
+import { getMe, formatSize } from './api'
 import { useTheme } from './composables/useTheme'
 import { useToast } from './composables/useToast'
 import { useTransfer } from './composables/useTransfer'
@@ -70,10 +70,33 @@ watch(
   () => route.fullPath,
   () => {
     sidebarOpen.value = false
+    contextCollapsed.value = false
   }
 )
 
-onMounted(loadUser)
+const storagePct = computed(() => {
+  const quota = user.value?.quota_bytes || 0
+  const used = user.value?.used_bytes || 0
+  if (quota <= 0) return 100
+  return Math.min(100, Math.round((used / quota) * 100))
+})
+
+let offUploadComplete = null
+// 移动端顶栏第二排（上下文栏）滚动自动收起
+const contextCollapsed = ref(false)
+function onWinScroll() {
+  contextCollapsed.value = window.scrollY > 48
+}
+onMounted(() => {
+  loadUser()
+  // 上传完成后刷新用户信息，同步最新容量用量
+  offUploadComplete = transfer.onUploadComplete(() => loadUser())
+  window.addEventListener('scroll', onWinScroll, { passive: true })
+})
+onBeforeUnmount(() => {
+  if (offUploadComplete) offUploadComplete()
+  window.removeEventListener('scroll', onWinScroll)
+})
 
 // Keep user state fresh when token appears (e.g. after login redirect).
 router.afterEach(() => {
@@ -128,10 +151,34 @@ router.afterEach(() => {
           </button>
         </nav>
         <div class="sidebar-foot">
-          <button class="theme-toggle" @click="toggleTheme">
-            <span>{{ theme === 'dark' ? '☀️' : '🌙' }}</span>
-            <span>{{ theme === 'dark' ? '浅色模式' : '深色模式' }}</span>
-          </button>
+          <div class="user-box">
+            <div class="user-row">
+              <span class="user-name truncate" :title="user?.username">
+                {{ user?.username || '用户' }}
+              </span>
+              <span v-if="user?.role === 'admin'" class="badge" title="管理员">管理员</span>
+            </div>
+            <div class="quota-bar">
+              <div
+                class="quota-fill"
+                :class="{ over: storagePct >= 100 }"
+                :style="{ width: storagePct + '%' }"
+              />
+            </div>
+            <div class="quota-text muted small">
+              {{ formatSize(user?.used_bytes || 0) }} / {{ formatSize(user?.quota_bytes || 0) }}
+            </div>
+            <div class="user-actions">
+              <button
+                class="theme-btn btn-icon btn-ghost"
+                :aria-label="theme === 'dark' ? '切换到浅色' : '切换到深色'"
+                @click="toggleTheme"
+              >
+                {{ theme === 'dark' ? '☀️' : '🌙' }}
+              </button>
+              <button class="btn btn-sm btn-ghost logout-btn" @click="logout">退出</button>
+            </div>
+          </div>
         </div>
       </aside>
       <Transition name="fade">
@@ -144,37 +191,30 @@ router.afterEach(() => {
 
       <!-- Main column -->
       <div class="main">
-        <header class="topbar">
-          <button
-            class="hamburger btn-icon btn-ghost"
-            aria-label="菜单"
-            @click="sidebarOpen = !sidebarOpen"
-          >
-            ☰
-          </button>
-          <h1 class="page-title">{{ route.meta?.title || '我的文件' }}</h1>
-          <div class="grow" />
-          <div class="user-menu">
-            <span class="user-name truncate">
-              {{ user?.username || '用户' }}
-            </span>
-            <span
-              v-if="user?.role === 'admin'"
-              class="badge"
-              title="管理员"
-            >
-              管理员
-            </span>
+        <header class="mobile-topbar">
+          <div class="mobile-row">
             <button
-              class="theme-btn btn-icon btn-ghost"
-              :aria-label="theme === 'dark' ? '切换到浅色' : '切换到深色'"
-              @click="toggleTheme"
+              class="btn-icon btn-ghost"
+              aria-label="菜单"
+              @click="sidebarOpen = !sidebarOpen"
             >
-              {{ theme === 'dark' ? '☀️' : '🌙' }}
+              ☰
             </button>
-            <button class="btn btn-sm btn-ghost" @click="logout">
-              退出
+            <h1 class="mobile-title">{{ route.meta?.title || '我的文件' }}</h1>
+            <button
+              class="mobile-transfer btn-icon btn-ghost"
+              aria-label="传输"
+              @click="transfer.openDrawer('upload')"
+            >
+              📦
+              <span v-if="activeTransferCount" class="badge-transfer">
+                {{ activeTransferCount }}
+              </span>
             </button>
+          </div>
+          <!-- 上下文栏：内容由各页面 Teleport 注入（如 Home 的面包屑），空时自动隐藏 -->
+          <div class="mobile-context" :class="{ collapsed: contextCollapsed }">
+            <div id="mobile-context-bar" class="mobile-context-inner"></div>
           </div>
         </header>
 
@@ -316,37 +356,52 @@ router.afterEach(() => {
   display: flex;
   flex-direction: column;
 }
-.topbar {
-  position: sticky;
-  top: 0;
-  z-index: 100;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  height: var(--topbar-height);
-  padding: 0 18px;
-  background: var(--bg-elevated);
-  border-bottom: 1px solid var(--border);
-}
-.hamburger {
+.mobile-topbar {
   display: none;
 }
-.page-title {
-  font-size: 1.1rem;
-  color: var(--text-heading);
+.user-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
 }
-.user-menu {
+.user-row {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
+  min-width: 0;
 }
 .user-name {
-  max-width: 140px;
-  font-weight: 500;
+  min-width: 0;
+  font-weight: 600;
   color: var(--text-heading);
 }
+.quota-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+}
+.quota-fill {
+  height: 100%;
+  background: var(--primary);
+  transition: width 0.2s ease;
+}
+.quota-fill.over {
+  background: var(--danger);
+}
+.user-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 .theme-btn {
-  display: none;
+  flex: 0 0 auto;
+}
+.logout-btn {
+  flex: 1 1 auto;
 }
 .content {
   flex: 1 1 auto;
@@ -361,16 +416,65 @@ router.afterEach(() => {
   z-index: 110;
 }
 
-/* Mobile: sidebar becomes a drawer */
+/* Mobile: sidebar becomes a drawer, dedicated compact topbar */
 @media (max-width: 768px) {
-  .hamburger {
-    display: inline-flex;
+  .mobile-topbar {
+    display: flex;
+    flex-direction: column;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    background: var(--bg-elevated);
+    border-bottom: 1px solid var(--border);
   }
-  .theme-btn {
-    display: inline-flex;
+  .mobile-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 44px;
+    padding: 0 10px;
   }
-  .user-name {
-    max-width: 90px;
+  .mobile-title {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-size: 1rem;
+    color: var(--text-heading);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .mobile-transfer {
+    position: relative;
+  }
+  .mobile-transfer .badge-transfer {
+    position: absolute;
+    top: 2px;
+    right: 0;
+    margin-left: 0;
+  }
+  /* 上下文栏：有内容时 34px，滚动时收起；无内容时整体隐藏 */
+  .mobile-context {
+    max-height: 34px;
+    overflow: hidden;
+    transition: max-height 0.2s ease;
+  }
+  .mobile-context.collapsed {
+    max-height: 0;
+  }
+  .mobile-context-inner {
+    display: flex;
+    align-items: center;
+    padding: 2px 10px;
+  }
+  .mobile-context-inner:empty {
+    display: none;
+  }
+  /* Teleport 进来的面包屑在窄栏内压缩：不换行、去最小高度 */
+  .mobile-context-inner :deep(.breadcrumb) {
+    min-height: 0;
+    padding: 0;
+    flex-wrap: nowrap;
+    overflow: hidden;
   }
   .sidebar {
     position: fixed;

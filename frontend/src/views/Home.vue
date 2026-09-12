@@ -250,17 +250,10 @@ async function onRemove(item, kind) {
 }
 
 /* ----------------------------- Upload ------------------------------------ */
-/* 上传入口保留在页面（dropzone），进度统一在「传输」抽屉查看 */
+/* 拖放由全局隐形 dropzone（UploadZone）接管；点击入口通过 openPicker 唤起文件选择 */
 const uploadRef = ref(null)
-const showUpload = ref(true)
-function onGridDrop(e) {
-  const dropped = e.dataTransfer?.files
-  if (dropped && dropped.length) {
-    // 直接进入全局队列（不依赖 UploadZone 实例，避免其未挂载时空指针）
-    transfer.enqueueUpload(dropped, currentFolderId.value)
-    showUpload.value = true
-  }
-}
+// 顶栏 Teleport 目标（App 渲染的 #mobile-context-bar）需等挂载完成后才存在
+const ctxReady = ref(false)
 
 // 上传完成后：把文件插进当前目录列表；若是图片则轮询补齐后台生成的缩略图
 let uploadPendingIds = new Set()
@@ -314,6 +307,7 @@ function onGlobalUploadComplete({ fileId, folderId, name, isImage }) {
 
 onMounted(() => {
   clearUploadCb = transfer.onUploadComplete(onGlobalUploadComplete)
+  ctxReady.value = true
 })
 onBeforeUnmount(() => {
   clearUploadCb && clearUploadCb()
@@ -499,30 +493,26 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="home" @drop.prevent="onGridDrop" @dragover.prevent>
+  <div class="home">
     <div class="toolbar card">
       <Breadcrumb :path="breadcrumb" @navigate="navigateTo" />
       <div class="actions">
         <button class="btn btn-sm" @click="openNewFolder">＋ 新建文件夹</button>
         <button
-          class="btn btn-sm"
-          :class="{ 'btn-primary': showUpload }"
-          @click="showUpload = !showUpload"
+          class="btn btn-sm btn-ghost"
+          @click="uploadRef?.openPicker()"
         >
           ⬆️ 上传
-        </button>
-        <button v-if="files.length || folders.length" class="btn btn-sm btn-ghost" @click="selectAll">
-          全选
         </button>
       </div>
     </div>
 
-    <UploadZone
-      v-if="showUpload"
-      ref="uploadRef"
-      :folder-id="currentFolderId"
-      compact
-    />
+    <UploadZone ref="uploadRef" :folder-id="currentFolderId" />
+
+    <!-- 移动端顶栏上下文栏：把面包屑注入 App 顶栏第二排（桌面端该栏隐藏） -->
+    <Teleport v-if="ctxReady" to="#mobile-context-bar">
+      <Breadcrumb :path="breadcrumb" @navigate="navigateTo" />
+    </Teleport>
 
     <!-- Loading -->
     <div v-if="loading" class="grid">
@@ -553,7 +543,7 @@ onMounted(() => {
       <span class="emoji">📂</span>
       <h3>此文件夹为空</h3>
       <p>上传文件或新建文件夹来开始管理</p>
-      <button class="btn btn-primary btn-sm" @click="showUpload = true">
+      <button class="btn btn-primary btn-sm" @click="uploadRef?.openPicker()">
         ⬆️ 上传文件
       </button>
     </div>
@@ -854,6 +844,10 @@ onMounted(() => {
   }
   .toolbar {
     padding: 10px;
+  }
+  /* 面包屑已上移至顶栏上下文栏，隐藏工具栏内的原面包屑避免重复 */
+  .toolbar :deep(.breadcrumb) {
+    display: none;
   }
 }
 @media (max-width: 480px) {

@@ -10,6 +10,7 @@ pub struct User {
     pub created_at: String,
     pub role: String,
     pub expires_at: Option<String>,
+    pub quota_bytes: i64,
 }
 
 /// 公开用户信息（不含密码）
@@ -20,6 +21,7 @@ pub struct UserInfo {
     pub created_at: String,
     pub role: String,
     pub expires_at: Option<String>,
+    pub quota_bytes: i64,
 }
 
 impl From<User> for UserInfo {
@@ -30,6 +32,7 @@ impl From<User> for UserInfo {
             created_at: u.created_at,
             role: u.role,
             expires_at: u.expires_at,
+            quota_bytes: u.quota_bytes,
         }
     }
 }

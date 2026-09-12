@@ -19,6 +19,7 @@ pub struct CreateUserRequest {
     pub password: String,
     pub role: Option<String>,
     pub expires_at: Option<Option<String>>,
+    pub quota_bytes: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +28,7 @@ pub struct UpdateUserRequest {
     pub password: Option<String>,
     pub role: Option<String>,
     pub expires_at: Option<Option<String>>,
+    pub quota_bytes: Option<i64>,
 }
 
 /// 归一化有效期字符串为 "YYYY-MM-DD HH:MM:SS" 格式；日期仅当天的视为截止 23:59:59。
@@ -54,6 +56,13 @@ async fn build_admin_user(pool: &SqlitePool, user: User) -> Result<serde_json::V
     .fetch_one(pool)
     .await?;
 
+    // 用量含回收站（软删除文件仍占磁盘），与配额校验口径一致
+    let (used_bytes,): (i64,) =
+        sqlx::query_as("SELECT COALESCE(SUM(size), 0) FROM files WHERE owner_id = ?")
+            .bind(user.id)
+            .fetch_one(pool)
+            .await?;
+
     let original_folder_id: Option<(i64,)> = sqlx::query_as(
         "SELECT id FROM folders WHERE owner_id = ? AND name = '原图' AND parent_id IS NULL AND deleted_at IS NULL",
     )
@@ -68,6 +77,14 @@ async fn build_admin_user(pool: &SqlitePool, user: User) -> Result<serde_json::V
         "role": info.role,
         "created_at": info.created_at,
         "expires_at": info.expires_at,
+        "quota_bytes": info.quota_bytes,
+        "used_bytes": used_bytes,
+        "formatted_used": crate::models::file::format_file_size(used_bytes),
+        "usage_percent": if info.quota_bytes > 0 {
+            ((used_bytes as f64 / info.quota_bytes as f64) * 1000.0).round() / 10.0
+        } else {
+            100.0
+        },
         "file_count": file_count,
         "original_folder_id": original_folder_id.map(|(id,)| id),
     }))
@@ -114,14 +131,20 @@ pub async fn create_user(
 
     let password_hash = crate::utils::crypto::hash_password(&req.password)?;
     let expires_at = normalize_expires(req.expires_at.flatten());
+    let quota_bytes = match req.quota_bytes {
+        Some(v) if v < 0 => return Err(AppError::BadRequest("配额不能为负数".into())),
+        Some(v) => v,
+        None => 5_368_709_120,
+    };
 
     let user = sqlx::query_as::<_, User>(
-        "INSERT INTO users (username, password_hash, role, expires_at) VALUES (?, ?, ?, ?) RETURNING *",
+        "INSERT INTO users (username, password_hash, role, expires_at, quota_bytes) VALUES (?, ?, ?, ?, ?) RETURNING *",
     )
     .bind(&username)
     .bind(&password_hash)
     .bind(role)
     .bind(&expires_at)
+    .bind(quota_bytes)
     .fetch_one(&pool)
     .await
     .map_err(|e| match e {
@@ -189,14 +212,21 @@ pub async fn update_user(
     if let Some(v) = req.expires_at {
         user.expires_at = normalize_expires(v);
     }
+    if let Some(q) = req.quota_bytes {
+        if q < 0 {
+            return Err(AppError::BadRequest("配额不能为负数".into()));
+        }
+        user.quota_bytes = q;
+    }
 
     let updated = sqlx::query_as::<_, User>(
-        "UPDATE users SET username = ?, password_hash = ?, role = ?, expires_at = ?, created_at = created_at WHERE id = ? RETURNING *",
+        "UPDATE users SET username = ?, password_hash = ?, role = ?, expires_at = ?, quota_bytes = ?, created_at = created_at WHERE id = ? RETURNING *",
     )
     .bind(&user.username)
     .bind(&user.password_hash)
     .bind(&user.role)
     .bind(&user.expires_at)
+    .bind(user.quota_bytes)
     .bind(user_id)
     .fetch_one(&pool)
     .await

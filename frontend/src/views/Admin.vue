@@ -108,7 +108,7 @@ async function onDeleteUser(user) {
 
 /* ---------------- 新建用户 ---------------- */
 const showCreate = ref(false)
-const cForm = reactive({ username: '', password: '', role: 'user', expires_at: '' })
+const cForm = reactive({ username: '', password: '', role: 'user', expires_at: '', quota: 5 })
 const cSaving = ref(false)
 const cErr = ref('')
 
@@ -117,6 +117,7 @@ function openCreate() {
   cForm.password = ''
   cForm.role = 'user'
   cForm.expires_at = ''
+  cForm.quota = 5
   if (currentUser.value?.role === 'admin') cForm.role = 'user'
   cErr.value = ''
   showCreate.value = true
@@ -128,11 +129,14 @@ async function submitCreate() {
   if (cForm.password.length < 6) { cErr.value = '密码长度至少 6 位'; return }
   cSaving.value = true
   try {
+    const quotaGb = Number(cForm.quota)
+    if (!Number.isFinite(quotaGb) || quotaGb < 0) { cErr.value = '配额必须是不小于 0 的数字'; return }
     const payload = {
       username: cForm.username.trim(),
       password: cForm.password,
       role: cForm.role,
       expires_at: cForm.expires_at || null, // null 表示清除/不设
+      quota_bytes: Math.round(quotaGb * 1024 * 1024 * 1024),
     }
     await adminCreateUser(payload)
     toast.success('用户已创建')
@@ -155,6 +159,7 @@ const eForm = reactive({
   password: '',
   expires_at: '',
   keepExpiry: true,
+  quotaGb: '',
 })
 const eSaving = ref(false)
 const eErr = ref('')
@@ -171,6 +176,8 @@ function openEdit(user) {
   eForm.password = ''
   eForm.expires_at = toLocal(user.expires_at)
   eForm.keepExpiry = true
+  eForm.quotaGb =
+    user.quota_bytes != null ? String(Number((user.quota_bytes / 1073741824).toFixed(2))) : ''
   eErr.value = ''
   showEdit.value = true
 }
@@ -184,6 +191,11 @@ async function submitEdit() {
     const payload = { username: eForm.username.trim() }
     if (eForm.role) payload.role = eForm.role
     if (eForm.password) payload.password = eForm.password
+    if (eForm.quotaGb !== '') {
+      const q = Number(eForm.quotaGb)
+      if (!Number.isFinite(q) || q < 0) { eErr.value = '配额必须是不小于 0 的数字'; return }
+      payload.quota_bytes = Math.round(q * 1024 * 1024 * 1024)
+    }
     // keepExpiry：不传 expires_at（保持不变）；
     // 否则按输入值或 null（清除）提交
     if (!eForm.keepExpiry) {
@@ -380,6 +392,7 @@ onMounted(() => {
               <th>用户名</th>
               <th>角色</th>
               <th>有效期</th>
+              <th>配额</th>
               <th>文件数</th>
               <th>创建时间</th>
               <th>操作</th>
@@ -410,6 +423,19 @@ onMounted(() => {
                   class="expiry"
                   :class="{ expired: u._expired }"
                 >{{ expiryText(u) }}</span>
+              </td>
+              <td>
+                <div class="quota-cell">
+                  <div class="quota-bar">
+                    <div
+                      :class="{ over: (u.usage_percent || 0) >= 100 }"
+                      :style="{ width: Math.min(100, u.usage_percent || 0) + '%' }"
+                    />
+                  </div>
+                  <span class="quota-text muted small">
+                    {{ u.formatted_used || '0 B' }} / {{ formatSize(u.quota_bytes || 0) }}
+                  </span>
+                </div>
               </td>
               <td class="muted">{{ u.file_count || 0 }}</td>
               <td class="muted small">{{ formatDate(u.created_at) }}</td>
@@ -463,6 +489,10 @@ onMounted(() => {
           <label>有效期（可选，留空 = 永久有效）</label>
           <input v-model="cForm.expires_at" class="input" type="datetime-local" />
         </div>
+        <div class="field">
+          <label>网盘配额（GB）</label>
+          <input v-model.number="cForm.quota" class="input" type="number" min="0" step="0.1" />
+        </div>
         <p v-if="cErr" class="err">{{ cErr }}</p>
         <div class="modal-actions">
           <button class="btn btn-ghost" @click="showCreate = false">取消</button>
@@ -498,6 +528,10 @@ onMounted(() => {
         <div class="field">
           <label>有效期</label>
           <input v-model="eForm.expires_at" class="input" type="datetime-local" :disabled="eForm.keepExpiry" />
+        </div>
+        <div class="field">
+          <label>网盘配额（GB，留空保持不变）</label>
+          <input v-model="eForm.quotaGb" class="input" type="number" min="0" step="0.1" placeholder="留空保持不变" />
         </div>
         <label class="check">
           <input v-model="eForm.keepExpiry" type="checkbox" />
@@ -669,6 +703,28 @@ tbody tr:hover {
 .expiry.expired {
   color: var(--danger);
   font-weight: 600;
+}
+.quota-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 130px;
+}
+.quota-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+.quota-bar div {
+  height: 100%;
+  background: var(--primary);
+}
+.quota-bar div.over {
+  background: var(--danger);
+}
+.quota-text {
+  white-space: nowrap;
 }
 .small {
   font-size: 0.8rem;

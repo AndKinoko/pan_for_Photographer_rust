@@ -30,6 +30,8 @@ desktop.ini
 *.sqlite
 *.sqlite3
 *.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
 # 显式屏蔽项目根 data.db（即使被通配符覆盖，这里再确保一次）
 /data.db
 
@@ -71,6 +73,20 @@ pnpm-debug.log*
 # .trae/ 是 Trae IDE 的本地工作目录，含规划文档、个人草稿
 # 这些不是项目源代码，避免隐私与冗余
 /.trae/
+
+# ───────── 大体积测试媒体（RAW 原片 / 样片，不应上库）─────────
+# 联调时拷进来的 RAW 与大图（如 DSC_4747.NEF），体积巨大且属个人作品
+*.nef
+*.cr2
+*.cr3
+*.arw
+*.dng
+*.raf
+*.orf
+*.rw2
+*.psd
+*.tif
+*.tiff
 
 # ───────── 临时文件 ─────────
 *.tmp
