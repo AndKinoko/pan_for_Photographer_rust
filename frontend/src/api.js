@@ -325,11 +325,26 @@ export function formatSize(bytes) {
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`
 }
 
-/** Format an ISO date string into a localised short form. */
+/**
+ * 解析后端时间字符串为 Date。
+ * 后端统一使用 UTC 存储（`YYYY-MM-DD HH:MM:SS`，与 SQLite datetime('now') 一致），
+ * 该形态不带时区标记，必须显式按 UTC 解析，否则会被浏览器当作本地时间导致偏差。
+ * 返回 null 表示无法解析。
+ */
+export function parseUtcDate(input) {
+  if (!input) return null
+  let s = String(input).trim()
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?(\.\d+)?$/.test(s)) {
+    s = `${s.replace(' ', 'T')}Z`
+  }
+  const d = new Date(s)
+  return Number.isNaN(d.getTime()) ? null : d
+}
+
+/** Format a UTC timestamp string into a localised short form. */
 export function formatDate(input) {
-  if (!input) return ''
-  const d = new Date(input)
-  if (Number.isNaN(d.getTime())) return input
+  const d = parseUtcDate(input)
+  if (!d) return input || ''
   const p = (x) => String(x).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(
     d.getHours()

@@ -91,3 +91,61 @@ pub fn format_file_size(size: i64) -> String {
         format!("{:.1} GB", size as f64 / (1024.0 * 1024.0 * 1024.0))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_file(preview: Option<&str>, thumb: Option<&str>) -> File {
+        File {
+            id: 9,
+            name: "DSC_0001.NEF".into(),
+            original_name: "DSC_0001.NEF".into(),
+            stored_path: "user_1/abc.nef".into(),
+            preview_path: preview.map(|s| s.to_string()),
+            thumb_path: thumb.map(|s| s.to_string()),
+            owner_id: 1,
+            folder_id: None,
+            size: 25_000_000,
+            file_type: "nef".into(),
+            uploaded_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-01 00:00:00".into(),
+            deleted_at: None,
+        }
+    }
+
+    #[test]
+    fn format_file_size_boundaries() {
+        assert_eq!(format_file_size(0), "0 B");
+        assert_eq!(format_file_size(1023), "1023 B");
+        assert_eq!(format_file_size(1024), "1.0 KB");
+        assert_eq!(format_file_size(1024 * 1024 - 1), "1024.0 KB");
+        assert_eq!(format_file_size(1024 * 1024), "1.0 MB");
+        assert_eq!(format_file_size(1024 * 1024 * 1024 - 1), "1024.0 MB");
+        assert_eq!(format_file_size(1024 * 1024 * 1024), "1.0 GB");
+    }
+
+    #[test]
+    fn to_info_without_preview_hides_media_urls() {
+        let info = sample_file(None, None).to_info();
+        assert!(!info.has_preview);
+        assert!(info.preview_url.is_none());
+        assert!(info.thumb_url.is_none());
+        assert_eq!(info.download_url, "/api/files/9/download");
+        assert_eq!(info.media_url, "/api/files/9/media");
+    }
+
+    #[test]
+    fn to_info_with_preview_falls_back_thumb_to_preview() {
+        let info = sample_file(Some("user_1/previews/a.jpg"), None).to_info();
+        assert!(info.has_preview);
+        assert_eq!(info.preview_url.as_deref(), Some("/api/files/9/media?preview=1"));
+        assert_eq!(info.thumb_url, info.preview_url);
+    }
+
+    #[test]
+    fn to_info_with_thumb_prefers_thumb_url() {
+        let info = sample_file(Some("user_1/previews/a.jpg"), Some("user_1/previews/a_thumb.jpg")).to_info();
+        assert_eq!(info.thumb_url.as_deref(), Some("/api/files/9/media?thumb=1"));
+    }
+}

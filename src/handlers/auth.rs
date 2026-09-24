@@ -81,11 +81,11 @@ pub async fn login(
     }
 
     // 校验账号有效期：expires_at 已过则拒绝登录（NULL 表示永久有效）
+    // 统一按 UTC 比较（存储与比较口径见 utils::time）
     if let Some(ref exp) = user.expires_at {
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        if exp.trim() <= now.as_str() {
+        if crate::utils::time::is_expired_utc(exp) {
             return Err(AppError::Unauthorized(format!(
-                "账号已过期（{}），请联系管理员续期",
+                "账号已过期（{} UTC），请联系管理员续期",
                 exp.trim()
             )));
         }

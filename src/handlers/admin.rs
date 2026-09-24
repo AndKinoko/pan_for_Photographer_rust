@@ -47,6 +47,38 @@ fn normalize_expires(v: Option<String>) -> Option<String> {
     Some(norm)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_expires_handles_empty_values() {
+        assert_eq!(normalize_expires(None), None);
+        assert_eq!(normalize_expires(Some(String::new())), None);
+        assert_eq!(normalize_expires(Some("   ".to_string())), None);
+    }
+
+    #[test]
+    fn normalize_expires_date_only_means_end_of_day() {
+        assert_eq!(
+            normalize_expires(Some("2026-12-31".to_string())),
+            Some("2026-12-31 23:59:59".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_expires_datetime_local_shapes() {
+        assert_eq!(
+            normalize_expires(Some("2026-12-31T08:30".to_string())),
+            Some("2026-12-31 08:30:00".to_string())
+        );
+        assert_eq!(
+            normalize_expires(Some("2026-12-31 08:30:15".to_string())),
+            Some("2026-12-31 08:30:15".to_string())
+        );
+    }
+}
+
 /// 将用户记录扩展为带统计信息与「原图」文件夹的管理端视图。
 async fn build_admin_user(pool: &SqlitePool, user: User) -> Result<serde_json::Value, AppError> {
     let (file_count,): (i64,) = sqlx::query_as(

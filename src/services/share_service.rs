@@ -1,4 +1,3 @@
-use chrono::Utc;
 use uuid::Uuid;
 
 use crate::errors::AppError;
@@ -24,8 +23,7 @@ pub async fn validate_share(
     }
 
     if let Some(ref expires_at) = share.expires_at {
-        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        if now > *expires_at {
+        if crate::utils::time::is_expired_utc(expires_at) {
             return Err(AppError::Gone("分享链接已过期".into()));
         }
     }
@@ -114,8 +112,7 @@ pub async fn create_share(
 
     let expires_at = if let Some(hours) = expires_hours {
         if hours > 0 {
-            let expiry = Utc::now() + chrono::Duration::hours(hours);
-            Some(expiry.format("%Y-%m-%d %H:%M:%S").to_string())
+            Some(crate::utils::time::utc_string_after_hours(hours))
         } else {
             None
         }
@@ -265,12 +262,11 @@ async fn share_to_info(pool: &SqlitePool, share: &FileShare) -> Result<ShareInfo
         ("(已删除)".to_string(), "".to_string(), 0, None, None, "(用户已删除)".to_string())
     };
 
-    let is_expired = if let Some(ref expires_at) = share.expires_at {
-        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        now > *expires_at
-    } else {
-        false
-    };
+    let is_expired = share
+        .expires_at
+        .as_deref()
+        .map(crate::utils::time::is_expired_utc)
+        .unwrap_or(false);
 
     let image_formats = ["jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "tif"];
     let inline_formats = ["pdf"];

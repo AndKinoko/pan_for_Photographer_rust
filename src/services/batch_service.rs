@@ -91,6 +91,45 @@ fn generate_unique_name(existing_names: &HashSet<String>, original: &str) -> Str
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn unique_name_appends_counter_before_extension() {
+        assert_eq!(generate_unique_name(&names(&[]), "a.jpg"), "a (1).jpg");
+        assert_eq!(
+            generate_unique_name(&names(&["a (1).jpg"]), "a.jpg"),
+            "a (2).jpg"
+        );
+        assert_eq!(
+            generate_unique_name(&names(&["a (1).jpg", "a (2).jpg"]), "a.jpg"),
+            "a (3).jpg"
+        );
+    }
+
+    #[test]
+    fn unique_name_without_extension() {
+        assert_eq!(generate_unique_name(&names(&[]), "README"), "README (1)");
+        assert_eq!(
+            generate_unique_name(&names(&["README (1)"]), "README"),
+            "README (2)"
+        );
+    }
+
+    #[test]
+    fn unique_name_uses_last_dot_as_extension() {
+        assert_eq!(
+            generate_unique_name(&names(&[]), "archive.tar.gz"),
+            "archive.tar (1).gz"
+        );
+    }
+}
+
 /// 批量移动文件和文件夹
 pub async fn batch_move(
     pool: &SqlitePool,

@@ -171,12 +171,21 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 /// 账号与初始密码从环境变量读取，避免硬编码在源码中泄露：
 ///   - `SEED_ADMIN_USERNAME`：默认 `"admin"`
 ///   - `SEED_ADMIN_PASSWORD`：默认空；若为空则**仅在数据库尚无任何 admin 时**打印警告并跳过创建，
-///     由首个启动者通过 `cargo run -- admin create` 或数据库直接操作完成初始化。
+///     由首个启动者通过环境变量重启或直接操作数据库完成初始化。
 pub async fn seed_admin(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let username =
         std::env::var("SEED_ADMIN_USERNAME").unwrap_or_else(|_| "admin".to_string());
     let password = std::env::var("SEED_ADMIN_PASSWORD").unwrap_or_default();
 
+    seed_admin_with(pool, &username, &password).await
+}
+
+/// 与 [`seed_admin`] 相同的逻辑，但账号密码由调用方显式传入（便于测试）。
+pub async fn seed_admin_with(
+    pool: &SqlitePool,
+    username: &str,
+    password: &str,
+) -> Result<(), sqlx::Error> {
     // 仅在数据库里"完全没有 admin"时尝试创建；已存在则什么都不做（保证幂等、不覆盖）。
     let admin_exists: Option<i64> =
         sqlx::query_scalar("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
@@ -198,7 +207,7 @@ pub async fn seed_admin(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         return Ok(());
     }
 
-    let password_hash = crate::utils::crypto::hash_password(&password)
+    let password_hash = crate::utils::crypto::hash_password(password)
         .map_err(|_| sqlx::Error::ColumnIndexOutOfBounds { index: 0, len: 1 })?;
 
     sqlx::query(
@@ -206,11 +215,143 @@ pub async fn seed_admin(pool: &SqlitePool) -> Result<(), sqlx::Error> {
            VALUES (?, ?, 'admin')
            ON CONFLICT(username) DO NOTHING"#,
     )
-    .bind(&username)
+    .bind(username)
     .bind(&password_hash)
     .execute(pool)
     .await?;
 
     tracing::info!("已创建 admin 账户 '{}'，请尽快登录后修改密码", username);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// 创建独立的临时 SQLite 数据库（文件形态，确保 WAL/迁移行为与生产一致）。
+    async fn temp_pool(name: &str) -> (SqlitePool, PathBuf) {
+        let unique = format!(
+            "pan_test_{}_{}_{}.db",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let path = std::env::temp_dir().join(unique);
+        let url = format!("sqlite:{}?mode=rwc", path.display());
+        let pool = init_db(&url).await.expect("初始化测试数据库失败");
+        (pool, path)
+    }
+
+    async fn cleanup(pool: SqlitePool, path: PathBuf) {
+        pool.close().await;
+        for suffix in ["", "-wal", "-shm"] {
+            let p = PathBuf::from(format!("{}{}", path.display(), suffix));
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[tokio::test]
+    async fn migrations_create_expected_schema() {
+        let (pool, path) = temp_pool("schema").await;
+
+        let tables: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let names: Vec<&str> = tables.iter().map(|(n,)| n.as_str()).collect();
+        for expected in ["users", "folders", "files", "file_shares"] {
+            assert!(names.contains(&expected), "缺少表 {}", expected);
+        }
+
+        let user_cols: Vec<(String,)> = sqlx::query_as("SELECT name FROM pragma_table_info('users')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let user_cols: Vec<&str> = user_cols.iter().map(|(n,)| n.as_str()).collect();
+        for expected in ["role", "expires_at", "quota_bytes"] {
+            assert!(user_cols.contains(&expected), "users 缺少列 {}", expected);
+        }
+
+        let file_cols: Vec<(String,)> = sqlx::query_as("SELECT name FROM pragma_table_info('files')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let file_cols: Vec<&str> = file_cols.iter().map(|(n,)| n.as_str()).collect();
+        for expected in ["thumb_path", "deleted_at"] {
+            assert!(file_cols.contains(&expected), "files 缺少列 {}", expected);
+        }
+
+        let share_cols: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM pragma_table_info('file_shares')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let share_cols: Vec<&str> = share_cols.iter().map(|(n,)| n.as_str()).collect();
+        for expected in ["folder_id", "max_downloads", "custom_code"] {
+            assert!(share_cols.contains(&expected), "file_shares 缺少列 {}", expected);
+        }
+
+        cleanup(pool, path).await;
+    }
+
+    #[tokio::test]
+    async fn migrations_are_idempotent() {
+        let (pool, path) = temp_pool("idempotent").await;
+        // 二次执行迁移不应报错（生产环境每次启动都会走一遍）
+        run_migrations(&pool).await.expect("重复迁移失败");
+        cleanup(pool, path).await;
+    }
+
+    #[tokio::test]
+    async fn seed_admin_with_creates_admin_then_skips() {
+        let (pool, path) = temp_pool("seed").await;
+
+        seed_admin_with(&pool, "boss", "SuperSecret123")
+            .await
+            .unwrap();
+        let admins: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'admin'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(admins, 1);
+
+        let hash_before: String =
+            sqlx::query_scalar("SELECT password_hash FROM users WHERE username = 'boss'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        // 已存在 admin 时再种子不应覆盖密码
+        seed_admin_with(&pool, "boss", "AnotherPassword456")
+            .await
+            .unwrap();
+        let hash_after: String =
+            sqlx::query_scalar("SELECT password_hash FROM users WHERE username = 'boss'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(hash_before, hash_after, "已存在的 admin 密码不应被覆盖");
+
+        cleanup(pool, path).await;
+    }
+
+    #[tokio::test]
+    async fn seed_admin_with_empty_password_creates_nothing() {
+        let (pool, path) = temp_pool("seed_empty").await;
+
+        seed_admin_with(&pool, "admin", "").await.unwrap();
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(users, 0);
+
+        cleanup(pool, path).await;
+    }
 }

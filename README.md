@@ -54,14 +54,15 @@ npm run build       # 输出到 ../static/（已被 .gitignore）
 ### 2. 配置 JWT 密钥（必须）
 
 ```bash
-# Windows PowerShell
-Set-Content -Path .secret_key -Value 'put-a-long-random-string-here' -NoNewline
+# Windows PowerShell（占位串需 ≥ 32 字节）
+Set-Content -Path .secret_key -Value 'replace-with-a-32-plus-byte-random-secret' -NoNewline
 
-# Linux / macOS
-echo -n 'put-a-long-random-string-here' > .secret_key
+# Linux / macOS（推荐直接生成）
+openssl rand -base64 48 > .secret_key
 ```
 
-> 密钥文件在 `.gitignore` 中，永不会被提交。**首次启动前必须创建**，否则后端会 panic。
+> 密钥文件在 `.gitignore` 中，永不会被提交。**首次启动前必须创建**，否则后端会 panic；
+> 长度不足 32 字节同样会 panic（见 `src/config.rs`）。
 
 ### 3. （可选）配置初始管理员
 
@@ -109,9 +110,9 @@ start_server.bat
 cargo run --release
 ```
 
-默认配置：
-- 监听：`SERVER_HOST=::`（IPv6 双栈，同时兼容 IPv4/IPv6 访问）+ `SERVER_PORT=0100`
-- 访问地址：`http://localhost:100`
+默认配置（与 `src/config.rs` / `start_server.bat` 一致）：
+- 监听：`SERVER_HOST=0.0.0.0`（仅 IPv4；需要 IPv6 双栈时设 `::`）+ `SERVER_PORT=8000`
+- 访问地址：`http://localhost:8000`
 - 静态目录：`static`（即上一步构建的前端）
 - 上传目录：`./uploads`，数据库：`./data.db`
 
@@ -126,7 +127,7 @@ cargo run --release
 管理端功能已并入 Vue 主站（`/admin`），不再需要独立管理前端；普通用户交付端 `static_user/` 保留（供客户只读取片）。
 
 - `8001`：影像交付端（`static_user/`）——客户只读：登录 / 浏览 / 预览 / 下载
-- `0100`：统一 Vue 前端（`static/`）——完整功能 + 管理端（admin 登录后访问 `/admin`：用户管理 / 有效期 / 配额调整 / 新建·编辑用户 / 为指定用户上传原图 / 系统统计）
+- `8002`：统一 Vue 前端（`static/`）——完整功能 + 管理端（admin 登录后访问 `/admin`：用户管理 / 有效期 / 配额调整 / 新建·编辑用户 / 为指定用户上传原图 / 系统统计）
 
 > 两端口共用同一数据库与上传目录。超管账号由 `SEED_ADMIN_USERNAME` / `SEED_ADMIN_PASSWORD` 环境变量控制（首次启动时设置）。
 
@@ -146,6 +147,14 @@ cargo run --release
 | `SEED_ADMIN_PASSWORD` | 首次启动时创建的 admin 密码 | *(空)* |
 | `MAX_FILE_SIZE` | 单文件最大字节数 | `10737418240` (10GB) |
 | `GC_INTERVAL_SEC` | 磁盘孤儿清理周期（秒），0 表示不清理 | `600` |
+| `CORS_ALLOWED_ORIGINS` | 追加的跨域白名单（逗号或空格分隔，如 `http://192.168.1.10:8002`） | *(空)* |
+
+> **时间约定**：数据库与后端内部一律使用 **UTC**（`YYYY-MM-DD HH:MM:SS`，与 SQLite `datetime('now')` 一致），
+> 用户有效期、分享过期时间均按 UTC 比较；前端在展示与输入时自动转换为浏览器本地时区。
+> 手工写库时请写入 UTC 时间。
+>
+> ⚠️ 若从旧版本升级：旧版账号有效期按**服务器本地时间**写入，统一为 UTC 后会被提前/延后解析，
+> 请管理员在 `/admin` 中重新保存一次相关用户的有效期（分享过期时间由后端生成，不受影响）。
 
 ---
 
@@ -156,9 +165,20 @@ cd frontend
 npm run dev
 ```
 
-Vite 开发服务器会代理 `/api` 到后端，配合 `cargo run` 使用。开发模式下 `SERVER_PORT` 改为非 100 的端口（如 `8001`）。
+Vite 开发服务器会把 `/api` 代理到 `http://localhost:8000`（见 `frontend/vite.config.js`），配合 `cargo run` 使用。
+若后端改用了其他端口，需同步修改 `vite.config.js` 中的 `server.proxy` 目标。
 
 ---
+
+## 测试
+
+```bash
+cargo test          # 后端单元测试（纯函数 + 临时 SQLite）
+```
+
+覆盖范围：时间工具（UTC 约定）、JWT / 密码哈希 / 分享访问凭证、文件名与扩展名校验、
+图片缩放与 JPEG 尺寸解析、批量重名处理、数据库迁移与种子管理员幂等性。
+前端暂无自动化测试。
 
 ## 项目结构
 
@@ -204,10 +224,10 @@ pan_for_Photographer/
 | POST | `/api/files/upload` | 上传文件（multipart 流式） |
 | GET  | `/api/files/:id/download` | 下载文件 |
 | GET  | `/api/files/:id/media` | 预览 / 缩略图 / 原图 |
-| 删除 | `/api/files/:id` | 软删除 |
+| DELETE | `/api/files/:id` | 软删除 |
 | POST | `/api/files/:id/restore` | 恢复 |
-| 删除 | `/api/files/:id/permanent` | 永久删除 |
-| 删除 | `/api/trash` | 清空回收站（并触发即时 GC） |
+| DELETE | `/api/files/:id/permanent` | 永久删除 |
+| DELETE | `/api/trash` | 清空回收站（并触发即时 GC） |
 | GET  | `/api/folders` | 文件夹列表 |
 | GET  | `/api/search` | 全局搜索 |
 | GET  | `/api/public/shares/:id` | 公开分享详情 |

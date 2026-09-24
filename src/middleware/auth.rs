@@ -53,6 +53,7 @@ where
         let claims = validate_token(token, &config).map_err(|_| rejection("认证失败"))?;
 
         // 校验账号有效期：expires_at 已过则拒绝（NULL 表示永久有效）
+        // 统一按 UTC 比较（存储与比较口径见 utils::time）
         let expires_at: Option<Option<String>> =
             sqlx::query_scalar("SELECT expires_at FROM users WHERE id = ?")
                 .bind(claims.sub)
@@ -62,8 +63,7 @@ where
                 .ok_or_else(|| rejection("认证失败"))?;
 
         if let Some(Some(exp)) = expires_at {
-            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            if exp.trim() <= now.as_str() {
+            if crate::utils::time::is_expired_utc(&exp) {
                 return Err(rejection("账号已过期，请联系管理员续期"));
             }
         }

@@ -353,3 +353,80 @@ pub async fn delete_file(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> Config {
+        Config {
+            server_host: "127.0.0.1".into(),
+            server_port: 0,
+            database_url: "sqlite::memory:".into(),
+            upload_dir: std::env::temp_dir().join("pan_test_uploads"),
+            static_dir: "static".into(),
+            jwt_secret: b"0123456789abcdef0123456789abcdef".to_vec(),
+            max_file_size: 1024,
+            gc_interval_sec: 0,
+        }
+    }
+
+    #[test]
+    fn validate_extension_blocks_dangerous_types() {
+        for name in ["evil.html", "evil.HTM", "x.svg", "a.js", "b.mjs", "c.SVG"] {
+            assert!(
+                validate_extension(name).is_err(),
+                "{} 应被阻止",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn validate_extension_allows_media_and_unknown_types() {
+        for name in ["photo.NEF", "raw.cr2", "clip.mp4", "doc.pdf", "noext", "archive.tar.gz"] {
+            assert!(
+                validate_extension(name).is_ok(),
+                "{} 应被允许",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn generate_stored_filename_keeps_extension_and_is_unique() {
+        let a = generate_stored_filename("DSC_0001.NEF");
+        let b = generate_stored_filename("DSC_0001.NEF");
+        assert!(a.ends_with(".NEF"));
+        assert!(b.ends_with(".NEF"));
+        assert_ne!(a, b, "存储名必须唯一");
+        // uuid simple 形态为 32 位十六进制
+        let stem = a.trim_end_matches(".NEF");
+        assert_eq!(stem.len(), 32);
+        assert!(stem.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn generate_stored_filename_defaults_to_bin() {
+        let name = generate_stored_filename("no_extension");
+        assert!(name.ends_with(".bin"));
+    }
+
+    #[test]
+    fn supports_preview_covers_images_and_raw() {
+        assert!(supports_preview("jpg"));
+        assert!(supports_preview("NEF"));
+        assert!(supports_preview("tiff"));
+        assert!(!supports_preview("mp4"));
+        assert!(!supports_preview("pdf"));
+        assert!(!supports_preview(""));
+    }
+
+    #[test]
+    fn user_upload_dir_is_per_user() {
+        let config = test_config();
+        let dir = user_upload_dir(&config, 42);
+        assert!(dir.ends_with("user_42"));
+        assert!(dir.starts_with(&config.upload_dir));
+    }
+}
+

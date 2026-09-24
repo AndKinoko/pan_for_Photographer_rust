@@ -312,3 +312,112 @@ pub fn generate_preview_and_thumb(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::codecs::jpeg::JpegEncoder;
+    use std::path::PathBuf;
+
+    fn test_config(upload_dir: PathBuf) -> Config {
+        Config {
+            server_host: "127.0.0.1".into(),
+            server_port: 0,
+            database_url: "sqlite::memory:".into(),
+            upload_dir,
+            static_dir: "static".into(),
+            jwt_secret: b"0123456789abcdef0123456789abcdef".to_vec(),
+            max_file_size: 1024,
+            gc_interval_sec: 0,
+        }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pan_preview_test_{}_{}_{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn encode_jpeg(width: u32, height: u32) -> Vec<u8> {
+        let img = image::RgbImage::new(width, height);
+        let mut buf = Vec::new();
+        JpegEncoder::new(&mut buf)
+            .encode(img.as_raw(), width, height, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn calc_resize_dims_preserves_aspect_and_never_upscales() {
+        // 横图受高度限制
+        assert_eq!(calc_resize_dims(4000, 3000, 1616, 1080), (1440, 1080));
+        // 竖图受宽度限制
+        assert_eq!(calc_resize_dims(3000, 4000, 1616, 1080), (810, 1080));
+        // 小图不放大
+        assert_eq!(calc_resize_dims(100, 50, 1616, 1080), (100, 50));
+        // 恰好等于上限
+        assert_eq!(calc_resize_dims(1616, 1080, 1616, 1080), (1616, 1080));
+        // 正方形
+        assert_eq!(calc_resize_dims(2000, 2000, 1000, 1000), (1000, 1000));
+    }
+
+    #[test]
+    fn read_jpeg_dimensions_reads_encoded_jpeg() {
+        let data = encode_jpeg(40, 24);
+        assert_eq!(read_jpeg_dimensions(&data), Some((40, 24)));
+    }
+
+    #[test]
+    fn read_jpeg_dimensions_rejects_garbage() {
+        assert_eq!(read_jpeg_dimensions(&[]), None);
+        assert_eq!(read_jpeg_dimensions(&[0xFF, 0xD8]), None);
+        assert_eq!(read_jpeg_dimensions(&[0u8; 64]), None);
+        assert_eq!(read_jpeg_dimensions(b"not a jpeg at all"), None);
+    }
+
+    #[test]
+    fn generate_preview_and_thumb_produces_both_files() {
+        let upload_dir = temp_dir("e2e");
+        let config = test_config(upload_dir.clone());
+
+        let src = upload_dir.join("source.png");
+        image::RgbImage::new(1000, 500).save(&src).unwrap();
+
+        let (preview_rel, thumb_rel) =
+            generate_preview_and_thumb(&config, 1, &src, "png");
+
+        let preview_rel = preview_rel.expect("应生成预览图");
+        let thumb_rel = thumb_rel.expect("应生成缩略图");
+        let preview = upload_dir.join(&preview_rel);
+        let thumb = upload_dir.join(&thumb_rel);
+
+        assert!(preview.exists());
+        assert!(thumb.exists());
+        assert_eq!(image::open(&preview).unwrap().dimensions(), (1000, 500));
+        assert_eq!(image::open(&thumb).unwrap().dimensions(), (360, 180));
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+
+    #[test]
+    fn generate_preview_and_thumb_rejects_unsupported_type() {
+        let upload_dir = temp_dir("unsupported");
+        let config = test_config(upload_dir.clone());
+
+        let src = upload_dir.join("note.txt");
+        std::fs::write(&src, b"hello").unwrap();
+
+        let result = generate_preview_and_thumb(&config, 2, &src, "txt");
+        assert_eq!(result, (None, None));
+
+        let _ = std::fs::remove_dir_all(&upload_dir);
+    }
+}

@@ -12,6 +12,7 @@ import {
   adminUploadToUser,
   formatDate,
   formatSize,
+  parseUtcDate,
 } from '../api'
 import { useToast } from '../composables/useToast'
 import { confirm } from '../composables/useConfirm'
@@ -60,9 +61,8 @@ async function loadUsers() {
 }
 
 function isExpired(expiresAt) {
-  if (!expiresAt) return false
-  const t = new Date(expiresAt.replace(' ', 'T'))
-  return !Number.isNaN(t.getTime()) && t.getTime() < Date.now()
+  const t = parseUtcDate(expiresAt)
+  return !!t && t.getTime() < Date.now()
 }
 
 function expiryText(u) {
@@ -135,7 +135,7 @@ async function submitCreate() {
       username: cForm.username.trim(),
       password: cForm.password,
       role: cForm.role,
-      expires_at: cForm.expires_at || null, // null 表示清除/不设
+      expires_at: fromLocalInput(cForm.expires_at), // null 表示清除/不设
       quota_bytes: Math.round(quotaGb * 1024 * 1024 * 1024),
     }
     await adminCreateUser(payload)
@@ -164,9 +164,22 @@ const eForm = reactive({
 const eSaving = ref(false)
 const eErr = ref('')
 
-function toLocal(v) {
-  if (!v) return ''
-  return v.replace(' ', 'T').slice(0, 16)
+/** 后端 UTC 字符串 → datetime-local 输入框所需的本地时间（YYYY-MM-DDTHH:MM） */
+function toLocalInput(v) {
+  const d = parseUtcDate(v)
+  if (!d) return ''
+  const p = (x) => String(x).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(
+    d.getHours()
+  )}:${p(d.getMinutes())}`
+}
+
+/** datetime-local 输入框的本地时间 → 后端 UTC 字符串（YYYY-MM-DD HH:MM:SS） */
+function fromLocalInput(v) {
+  if (!v) return null
+  const d = new Date(v)
+  if (Number.isNaN(d.getTime())) return null
+  return d.toISOString().slice(0, 19).replace('T', ' ')
 }
 
 function openEdit(user) {
@@ -174,7 +187,7 @@ function openEdit(user) {
   eForm.username = user.username
   eForm.role = user.role
   eForm.password = ''
-  eForm.expires_at = toLocal(user.expires_at)
+  eForm.expires_at = toLocalInput(user.expires_at)
   eForm.keepExpiry = true
   eForm.quotaGb =
     user.quota_bytes != null ? String(Number((user.quota_bytes / 1073741824).toFixed(2))) : ''
@@ -199,7 +212,7 @@ async function submitEdit() {
     // keepExpiry：不传 expires_at（保持不变）；
     // 否则按输入值或 null（清除）提交
     if (!eForm.keepExpiry) {
-      payload.expires_at = eForm.expires_at || null
+      payload.expires_at = fromLocalInput(eForm.expires_at)
     }
     await adminUpdateUser(eForm.id, payload)
     toast.success('用户已更新')
