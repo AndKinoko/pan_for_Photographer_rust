@@ -6,6 +6,10 @@ mod middleware;
 mod models;
 mod services;
 mod utils;
+
+/// HTTP 层集成测试。声明在 crate 根，因此可以直接调用 `build_router`。
+#[cfg(test)]
+mod http_tests;
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, FromRef},
@@ -15,6 +19,7 @@ use axum::{
     Router,
 };
 use sqlx::SqlitePool;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio_util::io::ReaderStream;
@@ -110,7 +115,15 @@ async fn main() {
         .await
         .expect("绑定地址失败");
 
-    axum::serve(listener, router)
+    // into_make_service_with_connect_info：让 handler 能拿到客户端 IP。
+    // 登录爆破限流按「用户名 + IP」双维度记账，没有它就只剩一个维度，
+    // 攻击者换个来源即可重来。build_router 仍返回 Router<()>——
+    // login 用的是 Option<ConnectInfo<_>>，缺少连接信息时降级而非报错，
+    // 所以单元测试夹具不需要改动。
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
         .await
         .expect("服务器运行错误");
 }
@@ -165,6 +178,7 @@ fn build_router(state: AppState) -> Router<()> {
     Router::new()
         // 认证路由
         .route("/api/auth/register", post(handlers::auth::register))
+        .route("/api/auth/invite/verify", post(handlers::auth::verify_invite))
         .route("/api/auth/login", post(handlers::auth::login))
         .route("/api/auth/me", get(handlers::auth::me))
         // 文件路由
@@ -218,15 +232,60 @@ fn build_router(state: AppState) -> Router<()> {
         .route("/api/admin/users/:id/folders", get(handlers::admin::admin_list_user_folders))
         .route("/api/admin/users/:id/folders", post(handlers::admin::admin_create_user_folder))
         .route("/api/admin/stats", get(handlers::admin::get_stats))
+        // 注册邀请码（注册制：管理员发码，客户凭码自助注册）
+        .route("/api/admin/invite-codes", get(handlers::admin::list_invite_codes))
+        .route("/api/admin/invite-codes", post(handlers::admin::create_invite_codes))
+        .route("/api/admin/invite-codes/:id", delete(handlers::admin::delete_invite_code))
+        // 孤儿文件清理（手动触发；后台另有 24 小时自动任务）
+        .route("/api/admin/gc/cleanup", post(handlers::admin::run_gc_cleanup))
+        .route("/api/admin/gc/status", get(handlers::admin::gc_status))
         // 健康检查
-        .route("/api/health", get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }))
+        // 存活探针。**必须符合全站统一的 {success, data, error} 信封**——
+        // 前端 axios 拦截器（api.js）对所有响应走同一套解析，遇到没有
+        // `success` 字段的响应会走兜底分支返回整个 body，调用方拿到的
+        // 就不是 `data` 了。之前这个端点返回裸 {"status":"ok"}，
+        // 是全站唯一的例外。
+        //
+        // `data.status` 同时保留，供 Docker HEALTHCHECK 与外部监控判断
+        // （curl 只看 HTTP 码，但有些探针会读 body 里的 status 字段）。
+        .route(
+            "/api/health",
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "success": true,
+                    "data": { "status": "ok" },
+                    "error": null
+                }))
+            }),
+        )
         // SPA：为分享路由及其他 SPA 路径提供 index.html
         .route("/share/*rest", get(spa_fallback))
         // 静态文件及 SPA 回退
         .fallback_service(static_service)
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(default_make_span))
         .layer(cors)
         .with_state(state)
+}
+
+/// 构造请求日志 span：**抹掉 query string，只留 path**。
+///
+/// 为什么不能直接用 `TraceLayer::new_for_http()`：它的默认实现把完整 URI
+/// （含 `?a=b&c=d`）写进 span 字段。本项目的缩略图/预览图走 `?token=<JWT>`
+/// 旁路（`<img src>` 无法携带 Authorization 头，见 frontend/src/api.js），
+/// 于是**每加载一次缩略图就把一个 7 天有效期的 bearer token 明文写进日志**，
+/// 而 compose 配了 10m×3 轮转，等于把凭据复制三份留在磁盘上。
+///
+/// 默认 `tower_http=info` 时请求日志是 DEBUG 级、够不着，所以平时看不出来；
+/// 但一旦有人为排查故障把 `RUST_LOG` 调成 `debug`，泄露立刻开始且不易察觉。
+/// 这里不依赖日志级别——无论怎么调，query 都不会进日志。
+fn default_make_span<B>(request: &Request<B>) -> tracing::Span {
+    // path_and_query 是最省事也最危险的写法；这里显式只取 path()。
+    tracing::info_span!(
+        "request",
+        method = %request.method(),
+        path = %request.uri().path(),
+        version = ?request.version(),
+    )
 }
 
 /// 构建 CORS 白名单来源：来自环境变量 CORS_ALLOWED_ORIGINS（空格或逗号分隔），

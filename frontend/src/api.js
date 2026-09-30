@@ -59,6 +59,13 @@ instance.interceptors.response.use(
       }
       const wrapped = new Error(msg)
       wrapped.status = status
+        // 429 时后端会算好「还需等待 N 秒」并写进提示语。
+        // 这里再解析出数字字段，让调用方能做**倒计时**——
+        // 只把那句话弹出来的话，数字会一直停在原地不动。
+        if (status === 429) {
+          const m = /(\d+)\s*秒/.exec(msg)
+          if (m) wrapped.retryAfter = Number(m[1])
+        }
       return Promise.reject(wrapped)
     }
     return Promise.reject(error)
@@ -88,8 +95,12 @@ export function authUrl(url) {
    Auth API
    =========================================================================== */
 
-export const register = (username, password) =>
-  instance.post('/api/auth/register', { username, password })
+export const register = (username, password, inviteCode) =>
+  instance.post('/api/auth/register', { username, password, invite_code: inviteCode })
+
+/** 校验邀请码是否可用（不消费）。注册页在填用户名之前先验一次。 */
+export const verifyInvite = (inviteCode) =>
+  instance.post('/api/auth/invite/verify', { invite_code: inviteCode })
 
 export const login = (username, password) =>
   instance.post('/api/auth/login', { username, password })
@@ -100,10 +111,51 @@ export const getMe = () => instance.get('/api/auth/me')
    Files API
    =========================================================================== */
 
-export const listFiles = (folderId) =>
-  instance.get('/api/files', {
-    params: folderId != null ? { folder_id: folderId } : {},
-  })
+/**
+ * 把列表接口的分页响应归一化成同一种形状，供 `useProgressiveList` 消费。
+ *
+ * 三个接口的原始字段名有差异（`/api/files` 用 total，`/api/trash` 与
+ * `/api/search` 用 total_files），归一化只在这一处做，视图层就不必各自记住
+ * 「哪个接口叫什么」。这也是前端唯一需要了解分页字段的地方。
+ */
+function normalizePage(data, { withFolders = false } = {}) {
+  const d = data || {}
+  const page = {
+    files: d.files || [],
+    total: d.total ?? d.total_files ?? 0,
+    hasMore: !!d.has_more,
+    nextCursor: d.next_cursor || null,
+  }
+  if (withFolders) {
+    page.folders = d.folders || []
+    page.totalFolders = d.total_folders ?? page.folders.length
+  }
+  if (d.file_types) page.fileTypes = d.file_types
+  return page
+}
+
+/** 分页参数：只在有值时才带上，避免出现 `limit=undefined` 这种请求 */
+function pageParams({ limit, cursor } = {}) {
+  const p = {}
+  if (limit) p.limit = limit
+  if (cursor) p.cursor = cursor
+  return p
+}
+
+/**
+ * GET /api/files（游标分页）
+ * @param {number|null} folderId
+ * @param {{limit?: number, cursor?: string|null}} [page]
+ */
+export const listFiles = (folderId, page) =>
+  instance
+    .get('/api/files', {
+      params: {
+        ...(folderId != null ? { folder_id: folderId } : {}),
+        ...pageParams(page),
+      },
+    })
+    .then((d) => normalizePage(d))
 
 export const renameFile = (id, name) =>
   instance.put(`/api/files/${id}/rename`, { name })
@@ -141,7 +193,10 @@ export const permanentDeleteFolder = (id) =>
    Trash API
    =========================================================================== */
 
-export const listTrash = () => instance.get('/api/trash')
+export const listTrash = (page) =>
+  instance
+    .get('/api/trash', { params: pageParams(page) })
+    .then((d) => normalizePage(d, { withFolders: true }))
 
 export const emptyTrash = () => instance.delete('/api/trash')
 
@@ -184,8 +239,11 @@ export const publicShareMediaUrl = (id, { thumb = false, preview = false } = {})
    Search API
    =========================================================================== */
 
+/** GET /api/search（游标分页）。`params` 里直接带 `limit` / `cursor`。 */
 export const searchFiles = (params) =>
-  instance.get('/api/search', { params })
+  instance
+    .get('/api/search', { params })
+    .then((d) => normalizePage(d, { withFolders: true }))
 
 /* ===========================================================================
    Batch API
@@ -216,6 +274,23 @@ export const adminDeleteUser = (id) =>
   instance.delete(`/api/admin/users/${id}`)
 
 export const adminGetStats = () => instance.get('/api/admin/stats')
+
+/* ── 注册邀请码 ────────────────────────────────────────────────
+   注册制下，摄影师靠发码决定「谁能进这个网盘」。管理端需要能
+   批量生成（一次发给几个客户）、查看哪些已被谁用掉、以及删除。 */
+export const adminListInviteCodes = () => instance.get('/api/admin/invite-codes')
+
+export const adminCreateInviteCodes = (payload) =>
+  instance.post('/api/admin/invite-codes', payload)
+
+export const adminDeleteInviteCode = (id) =>
+  instance.delete(`/api/admin/invite-codes/${id}`)
+
+/* 孤儿文件清理。后台每 24 小时自动跑一次，这里是手动入口——
+   运维发现磁盘占用异常时可以立刻处理。 */
+export const adminRunGcCleanup = () => instance.post('/api/admin/gc/cleanup')
+
+export const adminGetGcStatus = () => instance.get('/api/admin/gc/status')
 
 /* ----- 管理端：用户增改 / 代管文件夹 / 代为上传 ----- */
 
@@ -298,22 +373,30 @@ export function isPreviewable(type = '', name = '') {
   )
 }
 
-/** Returns an emoji icon for a file based on its type/name. */
+/**
+ * 返回文件对应的**图标名**（`src/icons.js` 注册表里的键），交给 `<AppIcon>` 渲染。
+ *
+ * 原先这里返回 emoji 字符串，导致整个文件类型图标体系无法主题化：emoji 的颜色由
+ * 字体决定，`--primary` 换色、暗色模式提亮都对它无效，且无法 aria-hidden。
+ * 改为返回名字后，图标成了真正的组件，跟随 `color` 与主题令牌。
+ *
+ * 注意：不要在任何 UI 里直接渲染这个返回值，必须经 `<AppIcon :name="...">`。
+ */
 export function fileIcon(type = '', name = '') {
   const ext = extOf(name) || type.toLowerCase()
-  if (ext === 'folder') return '📁'
-  if (IMAGE_EXT.includes(ext) || RAW_EXT.includes(ext)) return '🖼️'
-  if (VIDEO_EXT.includes(ext)) return '🎬'
-  if (AUDIO_EXT.includes(ext)) return '🎵'
-  if (ext === 'pdf') return '📕'
-  if (DOC_EXT.includes(ext)) return '📘'
-  if (SHEET_EXT.includes(ext)) return '📊'
-  if (SLIDE_EXT.includes(ext)) return '📙'
-  if (ARCHIVE_EXT.includes(ext)) return '📦'
-  if (['txt', 'md', 'rtf'].includes(ext)) return '📃'
+  if (ext === 'folder') return 'Folder'
+  if (IMAGE_EXT.includes(ext) || RAW_EXT.includes(ext)) return 'Image'
+  if (VIDEO_EXT.includes(ext)) return 'Film'
+  if (AUDIO_EXT.includes(ext)) return 'Music'
+  if (ext === 'pdf') return 'FileText'
+  if (DOC_EXT.includes(ext)) return 'FileText'
+  if (SHEET_EXT.includes(ext)) return 'FileSpreadsheet'
+  if (SLIDE_EXT.includes(ext)) return 'Presentation'
+  if (ARCHIVE_EXT.includes(ext)) return 'FileArchive'
+  if (['txt', 'md', 'rtf'].includes(ext)) return 'FileText'
   if (['json', 'js', 'ts', 'py', 'rs', 'go', 'java', 'c', 'cpp', 'html', 'css'].includes(ext))
-    return '💻'
-  return '📄'
+    return 'Code'
+  return 'File'
 }
 
 /** Human readable file size. */

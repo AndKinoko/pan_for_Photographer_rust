@@ -73,13 +73,17 @@
 
         <section id="file-section" class="section hidden">
           <div class="sec-head">
-            <h2 class="sec-title">文件</h2>
+            <h2 class="sec-title">文件 <span id="file-count" class="muted"></span></h2>
             <div class="batch-actions">
               <label class="chk"><input id="sel-all" type="checkbox" /> 全选</label>
               <button id="batch-dl" class="btn btn-sm btn-primary" disabled>⬇ 批量下载</button>
             </div>
           </div>
           <div id="files" class="grid"></div>
+          <!-- 分页：列表不再一次给全，客户需要知道还有多少没看到 -->
+          <div class="load-more-wrap">
+            <button id="load-more" class="btn btn-sm hidden">加载更多</button>
+          </div>
         </section>
       </main>
     </div>

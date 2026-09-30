@@ -2,6 +2,8 @@
 import { ref, watch, computed } from 'vue'
 import { createShare, batchShare } from '../api'
 import { useToast } from '../composables/useToast'
+import { useModal } from '../composables/useModal'
+import AppIcon from './AppIcon.vue'
 
 const props = defineProps({
   visible: { type: Boolean, default: false },
@@ -11,6 +13,10 @@ const props = defineProps({
 
 const emit = defineEmits(['update:visible', 'created'])
 const toast = useToast()
+
+const dialogEl = ref(null)
+// 焦点陷阱 / Esc / 焦点归还 / 背景 inert
+useModal(() => props.visible, { container: dialogEl, onClose: close })
 
 const expiresHours = ref(0)
 const enablePassword = ref(false)
@@ -88,11 +94,11 @@ async function submit() {
 <template>
   <Transition name="fade">
     <div v-if="visible" class="overlay" @mousedown.self="close">
-      <div class="dialog" role="dialog" aria-modal="true">
+      <div ref="dialogEl" class="dialog" role="dialog" aria-modal="true" tabindex="-1">
         <header class="head">
           <h3>{{ title }}</h3>
           <button class="btn-icon btn-ghost" aria-label="关闭" @click="close">
-            ✕
+            <AppIcon name="X" size="sm" />
           </button>
         </header>
 
@@ -173,7 +179,7 @@ async function submit() {
   align-items: center;
   justify-content: center;
   padding: 20px;
-  z-index: 8500;
+  z-index: var(--z-modal);
 }
 .dialog {
   width: min(92vw, 460px);

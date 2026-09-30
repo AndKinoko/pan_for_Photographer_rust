@@ -52,20 +52,17 @@ where
         let token = auth_header.ok_or_else(|| rejection("认证失败"))?;
         let claims = validate_token(token, &config).map_err(|_| rejection("认证失败"))?;
 
-        // 校验账号有效期：expires_at 已过则拒绝（NULL 表示永久有效）
-        // 统一按 UTC 比较（存储与比较口径见 utils::time）
-        let expires_at: Option<Option<String>> =
-            sqlx::query_scalar("SELECT expires_at FROM users WHERE id = ?")
-                .bind(claims.sub)
-                .fetch_optional(&pool)
-                .await
-                .map_err(|_| rejection("认证失败"))?
-                .ok_or_else(|| rejection("认证失败"))?;
-
-        if let Some(Some(exp)) = expires_at {
-            if crate::utils::time::is_expired_utc(&exp) {
-                return Err(rejection("账号已过期，请联系管理员续期"));
-            }
+        // 校验账号有效期：expires_at 已过则拒绝（NULL 表示永久有效）。
+        // 实际判定在 account_guard 里，与 ?token= 旁路、管理员提取器共用同一份实现。
+        if let Err(e) = crate::services::account_guard::require_active_account(&pool, claims.sub).await {
+            return Err((
+                e.status_code(),
+                Json(json!({
+                    "success": false,
+                    "data": null,
+                    "error": e.message()
+                })),
+            ));
         }
 
         Ok(AuthUser {

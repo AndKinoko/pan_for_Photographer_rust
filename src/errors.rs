@@ -17,6 +17,8 @@ pub enum AppError {
     Gone(String),
     Internal(String),
     PayloadTooLarge(String),
+    /// 429：请求过于频繁（登录爆破退避等）。
+    TooManyRequests(String),
 }
 
 impl AppError {
@@ -30,6 +32,7 @@ impl AppError {
             AppError::Gone(_) => StatusCode::GONE,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            AppError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
@@ -43,6 +46,7 @@ impl AppError {
             AppError::Gone(msg) => msg,
             AppError::Internal(_) => "服务器内部错误",
             AppError::PayloadTooLarge(msg) => msg,
+            AppError::TooManyRequests(msg) => msg,
         }
     }
 }

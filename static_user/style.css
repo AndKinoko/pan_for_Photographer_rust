@@ -142,6 +142,13 @@ p { margin: 0; }
   border-radius: 50%; animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ---- 分页「加载更多」 ---- */
+.load-more-wrap {
+  display: flex;
+  justify-content: center;
+  padding: 12px 0 4px;
+}
+
 /* ---- lightbox ---- */
 .overlay { position: fixed; inset: 0; background: var(--bg-overlay); backdrop-filter: blur(3px);
   display: flex; flex-direction: column; z-index: 1000; }

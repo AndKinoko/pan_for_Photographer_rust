@@ -1,5 +1,13 @@
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount, watch, provide } from 'vue'
+import {
+  ref,
+  computed,
+  onMounted,
+  onBeforeUnmount,
+  watch,
+  nextTick,
+  provide,
+} from 'vue'
 import { useRoute, useRouter, RouterView } from 'vue-router'
 import { getMe, formatSize } from './api'
 import { useTheme } from './composables/useTheme'
@@ -8,6 +16,7 @@ import { useTransfer } from './composables/useTransfer'
 import Toast from './components/Toast.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
 import TransferDrawer from './components/TransferDrawer.vue'
+import AppIcon from './components/AppIcon.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -22,20 +31,33 @@ const activeTransferCount = computed(
 const user = ref(null)
 const loadingUser = ref(true)
 const sidebarOpen = ref(false)
+const mainEl = ref(null)
+
+/* 路由切换后把焦点移到主内容区。
+   只监听 route.path 而不含 query：Home 的目录导航用 ?folder= 表达同一路径下的
+   不同目录，那种情况焦点应该留在文件网格里，不该被抢走。 */
+watch(
+  () => route.path,
+  async () => {
+    await nextTick()
+    mainEl.value?.focus()
+  }
+)
 
 provide('currentUser', user)
 
 const isPublicRoute = computed(() => route.meta?.public === true)
 
+// icon 存的是 src/icons.js 注册表里的键名，交给 <AppIcon> 渲染
 const navItems = computed(() => {
   const items = [
-    { to: '/', label: '我的文件', icon: '🗂️' },
-    { to: '/search', label: '搜索', icon: '🔍' },
-    { to: '/shares', label: '我的分享', icon: '🔗' },
-    { to: '/trash', label: '回收站', icon: '🗑️' },
+    { to: '/', label: '我的文件', icon: 'Files' },
+    { to: '/search', label: '搜索', icon: 'Search' },
+    { to: '/shares', label: '我的分享', icon: 'Link' },
+    { to: '/trash', label: '回收站', icon: 'Trash2' },
   ]
   if (user.value?.role === 'admin') {
-    items.push({ to: '/admin', label: '管理后台', icon: '⚙️' })
+    items.push({ to: '/admin', label: '管理后台', icon: 'Settings' })
   }
   return items
 })
@@ -114,6 +136,9 @@ router.afterEach(() => {
     <p class="muted">加载中…</p>
   </div>
   <div v-else class="layout">
+      <!-- 桌面端侧边栏有 5 个导航项挡在内容之前，键盘用户每次都要逐个 Tab 过去 -->
+      <a href="#main" class="skip-link">跳到主要内容</a>
+
       <!-- Sidebar (desktop) / drawer (mobile) -->
       <aside
         class="sidebar"
@@ -121,7 +146,7 @@ router.afterEach(() => {
         :aria-hidden="!sidebarOpen"
       >
         <div class="brand">
-          <span class="logo">📷</span>
+          <AppIcon class="logo" name="Camera" size="lg" />
           <div class="brand-text">
             <strong>摄影师网盘</strong>
             <small>Pan for Photographer</small>
@@ -135,7 +160,7 @@ router.afterEach(() => {
             class="nav-item"
             @click="sidebarOpen = false"
           >
-            <span class="nav-icon">{{ item.icon }}</span>
+            <AppIcon class="nav-icon" :name="item.icon" size="sm" />
             <span>{{ item.label }}</span>
           </RouterLink>
           <!-- 传输抽屉入口（非路由，点击弹出上传/下载队列） -->
@@ -143,7 +168,7 @@ router.afterEach(() => {
             class="nav-item transfer-entry"
             @click="transfer.openDrawer('upload')"
           >
-            <span class="nav-icon"> 📦 </span>
+            <AppIcon class="nav-icon" name="Package" size="sm" />
             <span>传输</span>
             <span v-if="activeTransferCount" class="badge-transfer">
               {{ activeTransferCount }}
@@ -174,7 +199,7 @@ router.afterEach(() => {
                 :aria-label="theme === 'dark' ? '切换到浅色' : '切换到深色'"
                 @click="toggleTheme"
               >
-                {{ theme === 'dark' ? '☀️' : '🌙' }}
+                <AppIcon :name="theme === 'dark' ? 'Sun' : 'Moon'" size="sm" />
               </button>
               <button class="btn btn-sm btn-ghost logout-btn" @click="logout">退出</button>
             </div>
@@ -198,7 +223,7 @@ router.afterEach(() => {
               aria-label="菜单"
               @click="sidebarOpen = !sidebarOpen"
             >
-              ☰
+              <AppIcon name="Menu" size="sm" />
             </button>
             <h1 class="mobile-title">{{ route.meta?.title || '我的文件' }}</h1>
             <button
@@ -206,7 +231,7 @@ router.afterEach(() => {
               aria-label="传输"
               @click="transfer.openDrawer('upload')"
             >
-              📦
+              <AppIcon name="Package" size="sm" />
               <span v-if="activeTransferCount" class="badge-transfer">
                 {{ activeTransferCount }}
               </span>
@@ -218,7 +243,7 @@ router.afterEach(() => {
           </div>
         </header>
 
-        <main class="content">
+        <main id="main" ref="mainEl" class="content" tabindex="-1">
           <RouterView />
         </main>
       </div>
@@ -256,7 +281,7 @@ router.afterEach(() => {
   position: sticky;
   top: 0;
   height: 100vh;
-  z-index: 120;
+  z-index: var(--z-sidebar);
 }
 .brand {
   display: flex;
@@ -265,7 +290,7 @@ router.afterEach(() => {
   padding: 6px 8px 18px;
 }
 .logo {
-  font-size: 1.6rem;
+  color: var(--primary);
 }
 .brand-text {
   display: flex;
@@ -314,9 +339,8 @@ router.afterEach(() => {
   cursor: pointer;
 }
 .nav-icon {
-  font-size: 1.1rem;
   width: 22px;
-  text-align: center;
+  justify-content: center;
 }
 .badge-transfer {
   margin-left: auto;
@@ -407,13 +431,15 @@ router.afterEach(() => {
   flex: 1 1 auto;
   padding: 20px;
   min-width: 0;
+  /* tabindex="-1" 是给路由切换后程序化聚焦用的，不该出现聚焦框 */
+  outline: none;
 }
 
 .backdrop {
   position: fixed;
   inset: 0;
   background: var(--bg-overlay);
-  z-index: 110;
+  z-index: var(--z-backdrop);
 }
 
 /* Mobile: sidebar becomes a drawer, dedicated compact topbar */
@@ -423,7 +449,7 @@ router.afterEach(() => {
     flex-direction: column;
     position: sticky;
     top: 0;
-    z-index: 100;
+    z-index: var(--z-sticky);
     background: var(--bg-elevated);
     border-bottom: 1px solid var(--border);
   }

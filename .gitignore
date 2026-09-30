@@ -35,6 +35,12 @@ desktop.ini
 # 显式屏蔽项目根 data.db（即使被通配符覆盖，这里再确保一次）
 /data.db
 
+# 备份产物。`.backup` API 生成的文件扩展名是 .snapshot，不被上面的
+# *.db / *.bak 覆盖——它含真实用户数据与密码哈希，绝不能进版本库。
+*.snapshot
+/backups/
+/migrate_backup/
+
 # 用户上传文件（占空间巨大、可能含隐私内容）
 /uploads/
 
@@ -53,6 +59,24 @@ secret.key
 # 若历史遗留重新出现（如从备份恢复），也不应被提交
 /static_admin/
 
+# ───────── 本机启动脚本（非构建必需）─────────
+# 最小可构建包的标准：只保留 Docker 镜像构建 + 容器编排所必需的文件。
+# 这三个是裸机 / Windows 用的，与 `docker build` 无关，不进版本库。
+/docker_start_server.bat
+/start_server.bat
+/start_publish.bat
+#
+# ⚠️ start_server.bat 与 start_publish.bat 在加入本规则之前就已被 git 跟踪，
+# 而 .gitignore 对**已跟踪文件无效**。若要让它们真正移出版本库，需手动执行：
+#     git rm --cached start_server.bat start_publish.bat
+# 这属于提交操作，请自行决定何时执行。
+
+# ───────── 废弃源码快照 ─────────
+# src/srcok/ 是一次测试回退验证时误建的**修复前**完整副本（35 个文件）。
+# main.rs 里没有对应的 mod 声明，Cargo 不会编译它；但它内容过时且体积不小，
+# 提交进去只会让人误以为是有效模块。若日后从历史恢复再出现，同样忽略。
+/src/srcok/
+
 # ───────── 包管理器日志 ─────────
 npm-debug.log*
 yarn-debug.log*
@@ -62,6 +86,8 @@ pnpm-debug.log*
 # ───────── IDE / 编辑器 ─────────
 .vscode/
 .idea/
+# Claude Code 的本机配置（launch.json 等），与项目无关
+/.claude/
 *.swp
 *.swo
 *~
@@ -69,10 +95,19 @@ pnpm-debug.log*
 # ───────── 日志 ─────────
 *.log
 
-# ───────── 本地规划文档 / IDE 草稿（个人笔记，不应上库）─────────
+# ───────── 过程性文档与 IDE 草稿（个人笔记，不上库）─────────
 # .trae/ 是 Trae IDE 的本地工作目录，含规划文档、个人草稿
-# 这些不是项目源代码，避免隐私与冗余
 /.trae/
+
+# docs/ 是本机的工作记录：审查报告、修复计划、测试报表等。
+# 这些文档记录的是「当时怎么做的、结论是什么」，对追溯有价值，
+# 但对本仓库的使用者没有指导意义（当前状态看 README 与 DEPLOY 即可），
+# 且会随每次改动不断膨胀。只在本机保留，不进版本库。
+/docs/
+
+# 根目录的一次性测试报表（每次测试重新生成，内容重复）
+/TEST_REPORT_*.md
+/PLAN_*.md
 
 # ───────── 大体积测试媒体（RAW 原片 / 样片，不应上库）─────────
 # 联调时拷进来的 RAW 与大图（如 DSC_4747.NEF），体积巨大且属个人作品
@@ -99,3 +134,22 @@ pnpm-debug.log*
 *.exe
 *.dll
 *.pdb
+
+# ───────── 部署配置（含密钥，务必不要提交）─────────
+# deploy.env 会被 compose / --env-file 直接读取，里面可能有 TUNNEL_TOKEN、
+# SEED_ADMIN_PASSWORD 等凭据。只提交 deploy.env.example 作为模板。
+deploy.env
+.env
+!.env.example
+!**/.env.example
+
+# 备份取回宿主机后的落地目录（docker compose cp app:/data/backups ...）
+# backup.sh 产出的是 .snapshot / .tgz / .key 三件套，必须成套保管。
+backups-*/
+*.tgz
+
+# 清理测试数据前做的快照（cleanup_backup/）
+/cleanup_backup/
+
+# 端到端测试脚本（临时验证用，不属于项目源代码）
+/p0_e2e_verify.py

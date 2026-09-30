@@ -2,6 +2,7 @@
 import { computed } from 'vue'
 import { useTransfer } from '../composables/useTransfer'
 import { formatSize } from '../api'
+import AppIcon from './AppIcon.vue'
 
 const {
   state,
@@ -15,8 +16,8 @@ const {
 } = useTransfer()
 
 const tabs = [
-  { key: 'upload', label: '上传列队', icon: '⬆️' },
-  { key: 'download', label: '下载列队', icon: '⬇️' },
+  { key: 'upload', label: '上传队列', icon: 'Upload' },
+  { key: 'download', label: '下载队列', icon: 'Download' },
 ]
 
 const activeItems = computed(() =>
@@ -49,11 +50,12 @@ function statusIcon(t) {
   return ''
 }
 
-function statusEmoji(t) {
-  if (t.status === 'done') return '✅'
-  if (t.status === 'saving') return '💾'
-  if (t.status === 'error') return '⚠️'
-  if (t.status === 'cancelled') return '✕'
+// 返回图标名而不是 emoji（见 src/icons.js）
+function statusIconName(t) {
+  if (t.status === 'done') return 'Check'
+  if (t.status === 'saving') return 'HardDrive'
+  if (t.status === 'error') return 'TriangleAlert'
+  if (t.status === 'cancelled') return 'X'
   return ''
 }
 
@@ -101,7 +103,9 @@ function onClear() {
           <strong class="td-title">传输</strong>
           <div v-if="overallText" class="td-sub muted">{{ overallText }}</div>
         </div>
-        <button class="btn-icon btn-ghost" aria-label="关闭" @click="closeDrawer">✕</button>
+        <button class="btn-icon btn-ghost" aria-label="关闭" @click="closeDrawer">
+          <AppIcon name="X" size="sm" />
+        </button>
       </header>
 
       <div class="td-tabs">
@@ -112,7 +116,8 @@ function onClear() {
           :class="{ active: state.activeTab === tab.key }"
           @click="setTab(tab.key)"
         >
-          {{ tab.icon }} {{ tab.label }}
+          <AppIcon :name="tab.icon" size="sm" />
+          {{ tab.label }}
         </button>
       </div>
 
@@ -123,7 +128,7 @@ function onClear() {
             <div class="td-row">
               <span class="td-icon" :class="statusIcon(t)">
                 <span v-if="statusIcon(t) === 'spinner sm'" class="spinner sm" />
-                <template v-else>{{ statusEmoji(t) }}</template>
+                <AppIcon v-else :name="statusIconName(t)" size="sm" />
               </span>
               <div class="td-main">
                 <div class="td-name truncate" :title="t.name">
@@ -137,7 +142,11 @@ function onClear() {
                     :style="{ width: (t.progress || 0) + '%' }"
                   />
                 </div>
-                <div v-if="t.error" class="td-error truncate">{{ t.error }}</div>
+                <!-- 不截断：传输失败的原因必须完整可读，而错误消息里
+                     通常含文件名与具体原因，截断后既读不到也复制不了。 -->
+                <div v-if="t.error" class="td-error" :title="t.error">
+                  {{ t.error }}
+                </div>
                 <div v-else-if="isActive(t)" class="td-progress muted small">
                   {{ Math.round(t.progress || 0) }}%
                 </div>
@@ -146,17 +155,19 @@ function onClear() {
                 v-if="isActive(t)"
                 class="td-action td-action-danger"
                 title="取消"
+                aria-label="取消"
                 @click="cancel(t)"
               >
-                ✕
+                <AppIcon name="X" size="sm" />
               </button>
               <button
                 v-else
                 class="td-action td-action-danger"
                 title="移除"
+                aria-label="移除"
                 @click="remove(t)"
               >
-                ✕
+                <AppIcon name="X" size="sm" />
               </button>
             </div>
           </li>
@@ -181,7 +192,7 @@ function onClear() {
   position: fixed;
   inset: 0;
   background: var(--bg-overlay);
-  z-index: 130;
+  z-index: var(--z-backdrop);
 }
 .transfer-drawer {
   position: fixed;
@@ -192,7 +203,7 @@ function onClear() {
   background: var(--bg-elevated);
   border-right: 1px solid var(--border);
   box-shadow: var(--shadow-lg);
-  z-index: 140;
+  z-index: var(--z-drawer);
   display: flex;
   flex-direction: column;
 }
@@ -264,10 +275,11 @@ function onClear() {
   justify-content: center;
   margin-top: 2px;
 }
-.td-icon.ok,
+.td-icon.ok {
+  color: var(--success);
+}
 .td-icon.bad {
-  font-size: 0.9rem;
-  line-height: 1;
+  color: var(--danger);
 }
 .td-main {
   flex: 1 1 auto;
@@ -279,11 +291,23 @@ function onClear() {
 }
 .td-action {
   flex: 0 0 auto;
+  /* 触屏下把可点区域扩到 44×44：24px 的目标在手机上很难点准（WCAG 2.2 下限 24，
+     移动端实践值 44）。视觉尺寸不变，用伪元素外扩。 */
   width: 24px;
   height: 24px;
   border-radius: 6px;
-  font-size: 0.8rem;
   color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+@media (hover: none) {
+  .td-action::after {
+    content: '';
+    position: absolute;
+    inset: -10px;
+  }
 }
 .td-action:hover {
   background: var(--bg-elevated);
@@ -291,9 +315,6 @@ function onClear() {
 }
 .td-action.td-action-danger {
   color: var(--danger);
-  font-weight: 700;
-  font-size: 1rem;
-  line-height: 1;
 }
 .td-action.td-action-danger:hover {
   background: var(--danger);

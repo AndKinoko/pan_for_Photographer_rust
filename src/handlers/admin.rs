@@ -5,7 +5,10 @@ use serde_json::{json, Value};
 use crate::errors::AppError;
 use crate::middleware::admin::AdminUser;
 use crate::models::user::{User, UserInfo};
+use crate::config::Config;
 use crate::services::folder_service;
+use crate::services::sweeper;
+use crate::services::invite_code_service;
 use sqlx::SqlitePool;
 
 #[derive(Debug, Deserialize)]
@@ -437,6 +440,152 @@ pub async fn admin_create_user_folder(
     Ok(Json(json!({
         "success": true,
         "data": folder,
+        "error": null
+    })))
+}
+
+// ===========================================================================
+// 注册邀请码
+// ---------------------------------------------------------------------------
+// 注册改为邀请制后，摄影师需要一个自助渠道发码给客户。这些接口全部由
+// AdminUser 提取器守护——它会验签 + 查库确认账号未过期 + 校验 role，
+// 所以过期管理员的令牌在这里同样进不来（见 middleware/admin.rs）。
+// ===========================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct CreateInviteCodesRequest {
+    /// 一次生成几个。批量是主用法：交付常常要一次给几个客户。
+    pub count: Option<i64>,
+    /// 每个码能被用几次。默认 1，即「一码一人」。
+    pub max_uses: Option<i64>,
+    /// 有效期（小时）。省略或 null 表示永不过期。
+    pub expires_hours: Option<i64>,
+    /// 备注，方便摄影师记「这个码给谁了」。会显示在管理列表里。
+    pub note: Option<String>,
+}
+
+/// GET /api/admin/invite-codes 列出全部邀请码
+pub async fn list_invite_codes(
+    State(pool): State<SqlitePool>,
+    _admin: AdminUser,
+) -> Result<Json<Value>, AppError> {
+    let codes = invite_code_service::list_codes(&pool).await?;
+
+    // 附带「谁用了这个码」的用户名，避免摄影师在两个页面之间来回对照。
+    let mut items = Vec::with_capacity(codes.len());
+    for c in codes {
+        let used_by_username: Option<String> = match c.used_by {
+            Some(uid) => sqlx::query_scalar("SELECT username FROM users WHERE id = ?")
+                .bind(uid)
+                .fetch_optional(&pool)
+                .await?,
+            None => None,
+        };
+        let mut v = serde_json::to_value(&c)?;
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("usable".into(), json!(c.is_usable()));
+            obj.insert("used_by_username".into(), json!(used_by_username));
+        }
+        items.push(v);
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "data": { "codes": items },
+        "error": null
+    })))
+}
+
+/// POST /api/admin/invite-codes 生成邀请码
+pub async fn create_invite_codes(
+    State(pool): State<SqlitePool>,
+    admin: AdminUser,
+    Json(req): Json<CreateInviteCodesRequest>,
+) -> Result<Json<Value>, AppError> {
+    let codes = invite_code_service::create_codes(
+        &pool,
+        admin.user_id,
+        req.count.unwrap_or(1),
+        req.max_uses.unwrap_or(1),
+        req.expires_hours,
+        req.note.as_deref().unwrap_or(""),
+    )
+    .await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "data": { "codes": codes },
+        "error": null
+    })))
+}
+
+/// DELETE /api/admin/invite-codes/:id 删除邀请码
+///
+/// 删已使用的码只是让列表干净，不影响已创建的账号——
+/// 账号归属由 users 表决定，删掉记录不会把人变成「无来源的用户」。
+pub async fn delete_invite_code(
+    State(pool): State<SqlitePool>,
+    _admin: AdminUser,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    invite_code_service::delete_code(&pool, id).await?;
+    Ok(Json(json!({
+        "success": true,
+        "data": null,
+        "error": null
+    })))
+}
+
+// ===========================================================================
+// 孤儿文件清理（手动触发）
+// ---------------------------------------------------------------------------
+// 孤儿文件只在异常路径后产生（进程被杀、用户被删、rename 后未 INSERT），
+// 不是正常产物，所以清理频率可以很低。后台任务每 24 小时自动跑一次，
+// 这里再提供一个手动入口——运维发现磁盘占用异常时可以立刻处理。
+//
+// 全部由 AdminUser 守护：它会验签 + 查库确认账号未过期 + 校验 role，
+// 所以过期管理员的令牌在这里同样进不来。
+// ===========================================================================
+
+/// POST /api/admin/gc/cleanup 立即执行一次孤儿清理
+pub async fn run_gc_cleanup(
+    State(pool): State<SqlitePool>,
+    _admin: AdminUser,
+    State(config): State<Config>,
+) -> Result<Json<Value>, AppError> {
+    // 防止并发点击：两个清理同时跑会互相争抢同一批文件
+    // （虽然 ORPHAN_GRACE 宽限期能兜住大部分情况，但没必要冒这个险）
+    static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err(AppError::TooManyRequests("上一次清理还在进行中，请稍候".into()));
+    }
+
+    let result = sweeper::cleanup_orphans(&pool, &config).await;
+    RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    let stats = result?;
+    Ok(Json(json!({
+        "success": true,
+        "data": stats,
+        "error": null
+    })))
+}
+
+/// GET /api/admin/gc/status 孤儿清理任务的状态
+///
+/// 只报告后台任务的**配置**，不报告「上次执行时间」——那个时间没有落盘
+/// （重启后重新计 24 小时是符合预期的：重启后手动点一次即可）。
+pub async fn gc_status(
+    _admin: AdminUser,
+) -> Result<Json<Value>, AppError> {
+    Ok(Json(json!({
+        "success": true,
+        "data": {
+            // 后台自动执行的间隔（小时）
+            "auto_interval_hours": sweeper::ORPHAN_CLEANUP_INTERVAL.as_secs() / 3600,
+            // 缩略图重投仍保持独立的高频周期
+            "preview_retry_note": "缩略图重投仍按 GC_INTERVAL_SEC 独立运行，不受此间隔影响"
+        },
         "error": null
     })))
 }

@@ -12,30 +12,41 @@ import {
   formatSize,
   formatDate,
 } from '../api'
+import AppIcon from '../components/AppIcon.vue'
+import LoadMore from '../components/LoadMore.vue'
 import { useToast } from '../composables/useToast'
+import { useProgressiveList } from '../composables/useProgressiveList'
 import { confirm } from '../composables/useConfirm'
 
 const toast = useToast()
 
-const files = ref([])
-const folders = ref([])
+/* 服务端游标分页状态机。回收站堆积几千项是常态（尤其是清空前）。 */
+const {
+  items: files,
+  folders,
+  total: totalFiles,
+  totalFolders,
+  hasMore: hasMoreFiles,
+  loadingMore,
+  error: pageError,
+  loadFirst: loadFirstPage,
+  loadMore: loadMoreFiles,
+} = useProgressiveList(({ limit, cursor }) => listTrash({ limit, cursor }))
 const loading = ref(false)
 const error = ref('')
 
-const total = () => files.value.length + folders.value.length
+/** 回收站总项数 = 文件总数（服务端报告，不是已加载数）+ 文件夹数。
+    用它来决定「清空回收站」是否可点、以及空态判断 —— 两者都该看真实总数。 */
+const total = () => totalFiles.value + totalFolders.value
 
 async function load() {
   loading.value = true
   error.value = ''
-  try {
-    const data = await listTrash()
-    files.value = data.files || []
-    folders.value = data.folders || []
-  } catch (e) {
-    error.value = e.message || '加载失败'
-  } finally {
-    loading.value = false
-  }
+  // 恢复/永久删除之后重新加载：复位到第一页，
+  // 因为列表内容已变，之前取到的游标不再对应任何有意义的位置
+  await loadFirstPage()
+  error.value = pageError.value
+  loading.value = false
 }
 
 async function onRestoreFile(f) {
@@ -114,7 +125,7 @@ onMounted(load)
   <div class="trash">
     <div class="head">
       <div>
-        <h2>回收站</h2>
+        <h1>回收站</h1>
         <p class="muted">共 {{ total() }} 项已删除</p>
       </div>
       <button
@@ -122,7 +133,7 @@ onMounted(load)
         :disabled="!total() || loading"
         @click="onEmpty"
       >
-        🧹 清空回收站
+        <AppIcon name="Trash2" size="sm" /> 清空回收站
       </button>
     </div>
 
@@ -131,32 +142,34 @@ onMounted(load)
     </div>
 
     <div v-else-if="error" class="state">
-      <span class="emoji">⚠️</span>
+      <AppIcon class="state-icon" name="CircleAlert" size="xl" />
       <h3>加载失败</h3>
       <p>{{ error }}</p>
       <button class="btn btn-primary btn-sm" @click="load">重试</button>
     </div>
 
     <div v-else-if="!total()" class="state">
-      <span class="emoji">♻️</span>
+      <AppIcon class="state-icon" name="RotateCcw" size="xl" />
       <h3>回收站为空</h3>
       <p>删除的文件会出现在这里，30 天内可恢复</p>
     </div>
 
     <template v-else>
       <div v-if="folders.length" class="section">
-        <h3 class="sec-title">文件夹 ({{ folders.length }})</h3>
+        <h2 class="sec-title">文件夹 ({{ folders.length }})</h2>
         <ul class="list card">
           <li v-for="f in folders" :key="'d' + f.id">
-            <span class="emoji">📁</span>
+            <AppIcon class="folder-ico" name="Folder" size="lg" />
             <div class="li-main">
-              <div class="li-name truncate">{{ f.name }}</div>
+              <div class="li-name truncate" :title="f.name">{{ f.name }}</div>
               <div class="li-sub muted">
                 删除于 {{ formatDate(f.deleted_at) }}
               </div>
             </div>
             <div class="li-actions">
-              <button class="btn btn-sm" @click="onRestoreFolder(f)">♻️ 恢复</button>
+              <button class="btn btn-sm" @click="onRestoreFolder(f)">
+                <AppIcon name="RotateCcw" size="sm" /> 恢复
+              </button>
               <button class="btn btn-sm btn-danger" @click="onPermanentFolder(f)">永久删除</button>
             </div>
           </li>
@@ -164,7 +177,7 @@ onMounted(load)
       </div>
 
       <div v-if="files.length" class="section">
-        <h3 class="sec-title">文件 ({{ files.length }})</h3>
+        <h2 class="sec-title">文件 ({{ totalFiles }})</h2>
         <ul class="list card">
           <li v-for="f in files" :key="'f' + f.id">
             <span class="thumb">
@@ -174,21 +187,36 @@ onMounted(load)
                 alt=""
                 @error="$event.target.style.display = 'none'"
               />
-              <span v-else class="emoji">{{ fileIcon(f.file_type, f.name) }}</span>
+              <AppIcon
+                v-else
+                class="file-icon"
+                :name="fileIcon(f.file_type, f.name)"
+                size="lg"
+              />
             </span>
             <div class="li-main">
-              <div class="li-name truncate">{{ f.name }}</div>
+              <div class="li-name truncate" :title="f.name">{{ f.name }}</div>
               <div class="li-sub muted">
                 {{ f.formatted_size || formatSize(f.size) }} · 删除于 {{ formatDate(f.deleted_at) }}
               </div>
             </div>
             <div class="li-actions">
-              <button class="btn btn-sm" @click="onRestoreFile(f)">♻️ 恢复</button>
+              <button class="btn btn-sm" @click="onRestoreFile(f)">
+                <AppIcon name="RotateCcw" size="sm" /> 恢复
+              </button>
               <button class="btn btn-sm btn-danger" @click="onPermanentFile(f)">永久删除</button>
             </div>
           </li>
         </ul>
       </div>
+
+      <LoadMore
+        :has-more="hasMoreFiles"
+        :loaded="files.length"
+        :total="totalFiles"
+        :loading="loadingMore"
+        @more="loadMoreFiles"
+      />
     </template>
   </div>
 </template>
@@ -206,7 +234,7 @@ onMounted(load)
   gap: 12px;
   flex-wrap: wrap;
 }
-.head h2 {
+.head h1 {
   font-size: 1.15rem;
 }
 .section {
@@ -252,11 +280,11 @@ onMounted(load)
   height: 100%;
   object-fit: cover;
 }
-.thumb .emoji {
-  font-size: 1.4rem;
+.thumb .file-icon {
+  color: var(--text-muted);
 }
-.list .emoji {
-  font-size: 1.5rem;
+.list .folder-ico {
+  color: var(--primary);
 }
 .li-main {
   flex: 1 1 auto;

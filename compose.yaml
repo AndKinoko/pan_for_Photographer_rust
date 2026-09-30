@@ -1,0 +1,103 @@
+# ============================================================================
+# Cloudflare Tunnel 部署：应用 + 隧道
+# ============================================================================
+#
+# **刻意不写 ports:** ——这是这套配置的核心。
+# 不映射端口 = 宿主机上没有任何入口，安全性来自网络隔离而非绑定地址。
+# cloudflared 通过 compose 网络用服务名 `app:8000` 访问应用，
+# 所以容器内 SERVER_HOST 必须是 0.0.0.0（见 deploy.env.example 的说明）。
+#
+# 这一点与裸机部署**正好相反**，容易搞混：
+#   裸机：SERVER_HOST=127.0.0.1，靠绑定地址保护
+#   容器：SERVER_HOST=0.0.0.0 且不映射端口，靠网络隔离保护
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pan-for-photographer:latest
+    restart: unless-stopped
+
+    # 唯一的配置来源。改这里，不要在别处再写一遍。
+    env_file:
+      - deploy.env
+
+    volumes:
+      # 数据库、上传文件、JWT 密钥同卷。
+      # 必须是 named volume 而不是 bind mount：Windows 上的 bind mount
+      # 不支持 chown，非 root 进程会因权限不足无法写入。
+      - pan-data:/data
+
+    # 刻意没有 ports:——宿主机上因此没有任何入口，外部只能经 Tunnel 进来。
+    # 需要本机调试入口时用 `docker compose --profile dev up -d`（见下方 app-dev）。
+
+    networks: [pan-net]
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Cloudflare Tunnel ──────────────────────────────────────
+  # 首次使用需要先登录并创建隧道：
+  #   docker compose run --rm cloudflared tunnel login
+  #   docker compose run --rm cloudflared tunnel create pan-delivery
+  # 然后把返回的隧道 ID 填进 deploy.env 的 TUNNEL_ID。
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_ID: ${TUNNEL_ID:?请在 deploy.env 里设置 TUNNEL_ID}
+      # token 方式登录（dashboard 创建的隧道会给出）。
+      # 与 TUNNEL_ID 二选一：命名隧道用 login + config 方式，
+      # 快速隧道（trycloudflare）则完全不需要下面任何一项。
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+    depends_on:
+      app:
+        condition: service_healthy
+    networks: [pan-net]
+
+  # ── 本机调试入口（opt-in）────────────────────────────────────
+  # 默认**不启动**：它存在的唯一目的是让开发机能在浏览器里打开
+  # http://127.0.0.1:8000 排查问题。
+  #
+  # 为什么要单独一个服务而不是给 app 加 ports：
+  # 端口映射写在 app 上就等于**常驻**一个入口，哪怕只绑回环，
+  # 也和「宿主机上没有任何入口」这个核心前提相抵触；而且要撤掉还得
+  # 改文件。做成 profile 后，调试完 `docker compose --profile dev down`
+  # 就彻底消失，不留配置痕迹。
+  #
+  # 端口当前绑 0.0.0.0（所有网卡），供局域网多机测试。
+  # 公网部署前务必改回 127.0.0.1 或移除本服务——同 WiFi 设备可访问 ≠ 安全。
+  app-dev:
+    image: pan-for-photographer:latest
+    profiles: ["dev"]
+    restart: unless-stopped
+    env_file:
+      - deploy.env
+    volumes:
+      - pan-data:/data
+    ports:
+      # 绑定到所有网卡，让同一局域网的设备能访问（多机测试用）。
+      # ⚠️ 这会让同 WiFi 下的任何设备都能打开这个网盘 —— 模拟互联网环境时
+      # 要清楚这一点。测完请改回 "127.0.0.1:8000:8000" 或直接
+      # `docker compose --profile dev rm -sf app-dev` 收掉。
+      - "0.0.0.0:8000:8000"
+    networks: [pan-net]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+
+volumes:
+  pan-data:
+    name: pan-data
+
+networks:
+  pan-net:
+    name: pan-net

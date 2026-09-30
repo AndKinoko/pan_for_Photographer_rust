@@ -212,14 +212,37 @@ pub async fn verify_share_password(
 }
 
 /// 增加分享的下载计数
-pub async fn increment_download_count(
-    pool: &SqlitePool,
-    share_id: &str,
-) -> Result<(), AppError> {
-    sqlx::query("UPDATE file_shares SET download_count = download_count + 1 WHERE id = ?")
-        .bind(share_id)
-        .execute(pool)
-        .await?;
+/// 占用一次下载额度：检查剩余次数并在**同一个事务里**自增。
+///
+/// 为什么不用「先 validate_share 检查、再单独 increment」：
+/// 那两步分属两个查询、两个事务。并发 N 个请求会同时读到
+/// `download_count = max - 1`，各自判定「还有额度」，然后全部自增——
+///
+/// **限额分享实际发出 max + (N-1) 次下载。**
+///
+/// 这里用 `UPDATE ... WHERE download_count < max_downloads` 让数据库自己裁决：
+/// 受影响行数为 0 就说明额度已尽，直接拒绝。检查与占用因此是原子的，
+/// 不依赖应用层加锁。
+///
+/// 调用方应当**先确认文件可读再占用**——顺序反了会把额度记在没真正发出的
+/// 下载上（见 handlers::share 的下载路径）。
+pub async fn consume_download_slot(pool: &SqlitePool, share_id: &str) -> Result<(), AppError> {
+    // max_downloads 为 NULL 表示不限次数，此时只自增、不做拦截。
+    let affected = sqlx::query(
+        "UPDATE file_shares SET download_count = download_count + 1
+         WHERE id = ?
+           AND (max_downloads IS NULL OR download_count < max_downloads)",
+    )
+    .bind(share_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    if affected == 0 {
+        // 两种可能：分享不存在，或额度已尽。
+        // 刻意不区分——区分开就成了探测分享码是否有效的旁路。
+        return Err(AppError::Gone("分享链接的下载次数已用尽".into()));
+    }
     Ok(())
 }
 
@@ -235,12 +258,17 @@ pub async fn get_public_share(
 /// 将 FileShare 转换为包含关联数据的 ShareInfo
 async fn share_to_info(pool: &SqlitePool, share: &FileShare) -> Result<ShareInfo, AppError> {
     // 获取文件或文件夹信息
+    //
+    // 两条查询都过滤 deleted_at：分享详情是**不需要任何凭证**就能拿到的元数据
+    // （文件名、所属者、下载计数）。文件进回收站后，下载/预览接口已由
+    // file_service::get_file_by_id 拦住，但若这里不过滤，
+    // 分享详情页仍会把真实文件名与归属者显示出来——等于从另一个口子继续泄露。
     let (file_name, file_type, file_size, preview_path, thumb_path, owner_name) = if let Some(fid) = share.file_id {
         let row: Option<(String, String, i64, Option<String>, Option<String>, String)> = sqlx::query_as(
             "SELECT f.original_name, f.file_type, f.size, f.preview_path, f.thumb_path, COALESCE(u.username, '(用户已删除)')
              FROM files f
              LEFT JOIN users u ON u.id = f.owner_id
-             WHERE f.id = ?",
+             WHERE f.id = ? AND f.deleted_at IS NULL",
         )
         .bind(fid)
         .fetch_optional(pool)
@@ -250,7 +278,7 @@ async fn share_to_info(pool: &SqlitePool, share: &FileShare) -> Result<ShareInfo
     } else if let Some(fid) = share.folder_id {
         let row: Option<(String, String)> = sqlx::query_as(
             "SELECT name, COALESCE((SELECT username FROM users WHERE id = folders.owner_id), '(用户已删除)')
-             FROM folders WHERE id = ?",
+             FROM folders WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(fid)
         .fetch_optional(pool)
@@ -272,7 +300,18 @@ async fn share_to_info(pool: &SqlitePool, share: &FileShare) -> Result<ShareInfo
     let inline_formats = ["pdf"];
     let ft = file_type.to_lowercase();
 
-    let preview_url = if preview_path.is_some() {
+    // 媒体接口自己会校验 ticket（未带凭证返回 401），所以这两个 URL 本身
+    // 不是凭据。但**有密码的分享一律不下发**：前端此前完全靠
+    // `has_password` 这一个字段决定要不要弹密码门，一旦该字段因后端改动
+    // 改名或漏返，媒体区就会直接裸奔。少给一个字段，就少一个能被利用的环节。
+    //
+    // 代价是：访客输完口令后要再调一次详情接口才能拿到 URL——前端
+    // PublicShare.vue 的 verify() 已经会重新 load()，所以实际无感。
+    let has_password = !share.password_hash.is_empty();
+
+    let preview_url = if has_password {
+        None
+    } else if preview_path.is_some() {
         Some(format!("/api/public/shares/{}/media?preview=1", share.id))
     } else if image_formats.contains(&ft.as_str()) || inline_formats.contains(&ft.as_str()) {
         Some(format!("/api/public/shares/{}/media", share.id))
@@ -280,7 +319,9 @@ async fn share_to_info(pool: &SqlitePool, share: &FileShare) -> Result<ShareInfo
         None
     };
 
-    let thumb_url = if thumb_path.is_some() {
+    let thumb_url = if has_password {
+        None
+    } else if thumb_path.is_some() {
         Some(format!("/api/public/shares/{}/media?thumb=1", share.id))
     } else if preview_url.is_some() {
         preview_url.clone()
@@ -299,7 +340,7 @@ async fn share_to_info(pool: &SqlitePool, share: &FileShare) -> Result<ShareInfo
         owner_name,
         created_at: share.created_at.clone(),
         expires_at: share.expires_at.clone(),
-        has_password: !share.password_hash.is_empty(),
+        has_password,
         download_count: share.download_count,
         max_downloads: share.max_downloads,
         is_active: share.is_active == 1,

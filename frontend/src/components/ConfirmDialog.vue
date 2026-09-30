@@ -1,23 +1,32 @@
 <script setup>
 import { ref, watch, nextTick } from 'vue'
 import { state, resolveConfirm } from '../composables/useConfirm'
+import { useModal } from '../composables/useModal'
 
 const inputEl = ref(null)
+const dialogEl = ref(null)
 
 // Reset a local mirror so two-way editing stays smooth.
 const localInput = ref('')
 
+/* 焦点陷阱 + Esc 统一交给 useModal。
+   原先无输入框的确认弹窗（删除、清空回收站）收不到 Esc/Enter——
+   容器 div 没有 tabindex，焦点进不来，@keydown 就永远不触发；
+   只有带输入框的重命名弹窗因为输入框被自动聚焦才碰巧能用。 */
+useModal(() => state.open, {
+  container: dialogEl,
+  onClose: cancel,
+  initialFocus: () => {
+    if (!state.inputLabel) return null
+    inputEl.value?.select()
+    return inputEl.value
+  },
+})
+
 watch(
   () => state.open,
-  async (open) => {
-    if (open) {
-      localInput.value = state.inputValue
-      await nextTick()
-      if (state.inputLabel) {
-        inputEl.value?.focus()
-        inputEl.value?.select()
-      }
-    }
+  (open) => {
+    if (open) localInput.value = state.inputValue
   }
 )
 
@@ -30,11 +39,9 @@ function confirm() {
 function onBackdrop() {
   cancel()
 }
+// 只处理 Enter；Esc 由 useModal 统一处理，避免同一次按键触发两次 cancel
 function onKeydown(e) {
-  if (e.key === 'Escape') {
-    e.preventDefault()
-    cancel()
-  } else if (e.key === 'Enter') {
+  if (e.key === 'Enter') {
     e.preventDefault()
     confirm()
   }
@@ -49,9 +56,11 @@ function onKeydown(e) {
       @mousedown.self="onBackdrop"
     >
       <div
+        ref="dialogEl"
         class="dialog"
         role="dialog"
         aria-modal="true"
+        tabindex="-1"
         @keydown="onKeydown"
       >
         <h3 class="title">{{ state.title }}</h3>
@@ -95,7 +104,7 @@ function onKeydown(e) {
   align-items: center;
   justify-content: center;
   padding: 20px;
-  z-index: 9000;
+  z-index: var(--z-confirm);
 }
 .dialog {
   width: min(92vw, 420px);

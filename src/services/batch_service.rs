@@ -8,7 +8,7 @@ use crate::services::folder_service;
 use sqlx::SqlitePool;
 
 /// 最大批处理大小，防止资源耗尽
-const MAX_BATCH_SIZE: usize = 500;
+pub const MAX_BATCH_SIZE: usize = 500;
 
 /// 验证所有 file_ids 和 folder_ids 都属于当前用户
 async fn verify_ownership(

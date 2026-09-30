@@ -1,32 +1,53 @@
 use std::collections::VecDeque;
 
 use crate::errors::AppError;
-use crate::models::folder::Folder;
+use crate::models::folder::{Folder, FolderInfo};
 use sqlx::SqlitePool;
 
-/// 列出用户的文件夹（可选按父文件夹过滤）
-/// 自动过滤已软删除的文件夹
+/// 列出用户的文件夹（可选按父文件夹过滤），**带文件数与子文件夹数**。
+/// 自动过滤已软删除的文件夹。
+///
+/// 为什么返回 `FolderInfo` 而不是 `Folder`：前端的文件夹卡片要显示
+/// 「N 个文件 · M 个子文件夹」（`FileCard.vue` 读 `file_count` /
+/// `subfolder_count`），而 `Folder` 结构体里没有这两个字段，于是
+/// `FileCard.vue` 的判断恒为 false、所有卡片都掉进「显示创建时间」的
+/// 兜底分支。`FolderInfo` 早就定义好了却一直没人用。
+///
+/// 计数用**一条 SQL + LEFT JOIN + 聚合子查询**取，而不是在 Rust 里
+/// 逐个文件夹再查一次（N+1：100 个文件夹 = 101 次查询）。
+/// 只统计未软删除的记录，与列表本身的过滤口径一致。
 pub async fn list_folders(
     pool: &SqlitePool,
     owner_id: i64,
     parent_id: Option<i64>,
-) -> Result<Vec<Folder>, AppError> {
-    let folders = if let Some(pid) = parent_id {
-        sqlx::query_as::<_, Folder>(
-            "SELECT * FROM folders WHERE owner_id = ? AND parent_id = ? AND deleted_at IS NULL ORDER BY name",
-        )
-        .bind(owner_id)
-        .bind(pid)
-        .fetch_all(pool)
-        .await?
-    } else {
-        sqlx::query_as::<_, Folder>(
-            "SELECT * FROM folders WHERE owner_id = ? AND parent_id IS NULL AND deleted_at IS NULL ORDER BY name",
-        )
-        .bind(owner_id)
-        .fetch_all(pool)
-        .await?
-    };
+) -> Result<Vec<FolderInfo>, AppError> {
+    let folders = sqlx::query_as::<_, FolderInfo>(
+        r#"
+        SELECT f.id, f.name, f.owner_id, f.parent_id, f.created_at, f.updated_at, f.deleted_at,
+               COALESCE(fc.cnt, 0) AS file_count,
+               COALESCE(sc.cnt, 0) AS subfolder_count
+        FROM folders f
+        LEFT JOIN (
+            SELECT folder_id, COUNT(*) AS cnt FROM files
+            WHERE deleted_at IS NULL AND folder_id IS NOT NULL
+            GROUP BY folder_id
+        ) fc ON fc.folder_id = f.id
+        LEFT JOIN (
+            SELECT parent_id AS pid, COUNT(*) AS cnt FROM folders
+            WHERE deleted_at IS NULL AND parent_id IS NOT NULL
+            GROUP BY parent_id
+        ) sc ON sc.pid = f.id
+        WHERE f.owner_id = ? AND f.deleted_at IS NULL
+          AND ((? IS NOT NULL AND f.parent_id = ?) OR (? IS NULL AND f.parent_id IS NULL))
+        ORDER BY f.name
+        "#,
+    )
+    .bind(owner_id)
+    .bind(parent_id)
+    .bind(parent_id)
+    .bind(parent_id)
+    .fetch_all(pool)
+    .await?;
 
     Ok(folders)
 }
@@ -135,8 +156,11 @@ pub async fn soft_delete_folder(
 
     // 软删除所有子文件夹中的文件
     for fid in &folder_ids {
-        sqlx::query("UPDATE files SET deleted_at = datetime('now') WHERE folder_id = ? AND deleted_at IS NULL")
+        // owner_id 是纵深防御：folder_ids 来自本用户的文件夹树，理论上已是自己的，
+        // 但 SQL 自身不带归属约束时，一旦上游判定出缺口就会连带删掉别人的文件。
+        sqlx::query("UPDATE files SET deleted_at = datetime('now') WHERE folder_id = ? AND owner_id = ? AND deleted_at IS NULL")
             .bind(fid)
+            .bind(owner_id)
             .execute(&mut *tx)
             .await?;
     }
@@ -218,8 +242,9 @@ pub async fn restore_folder(
 
     // 恢复所有文件夹中的文件
     for fid in &folder_ids {
-        sqlx::query("UPDATE files SET deleted_at = NULL WHERE folder_id = ?")
+        sqlx::query("UPDATE files SET deleted_at = NULL WHERE folder_id = ? AND owner_id = ?")
             .bind(fid)
+            .bind(owner_id)
             .execute(&mut *tx)
             .await?;
     }
@@ -239,18 +264,55 @@ pub async fn restore_folder(
 }
 
 /// 列出回收站中的文件夹
+///
+/// 同样返回 `FolderInfo`（带计数）：回收站页面复用同一套 `FileCard` 组件，
+/// 缺了 `file_count` / `subfolder_count` 会退回显示创建时间。
+/// 这里的计数口径是「**未被软删除**的文件/子文件夹」——已删的同级不该
+/// 再给用户一个「里面还有 N 个」的错觉。
 pub async fn list_trash_folders(
     pool: &SqlitePool,
     owner_id: i64,
-) -> Result<Vec<Folder>, AppError> {
-    let folders = sqlx::query_as::<_, Folder>(
-        "SELECT * FROM folders WHERE owner_id = ? AND deleted_at IS NOT NULL ORDER BY deleted_at DESC",
+) -> Result<Vec<FolderInfo>, AppError> {
+    let folders = sqlx::query_as::<_, FolderInfo>(
+        r#"
+        SELECT f.id, f.name, f.owner_id, f.parent_id, f.created_at, f.updated_at, f.deleted_at,
+               COALESCE(fc.cnt, 0) AS file_count,
+               COALESCE(sc.cnt, 0) AS subfolder_count
+        FROM folders f
+        LEFT JOIN (
+            SELECT folder_id, COUNT(*) AS cnt FROM files
+            WHERE deleted_at IS NULL AND folder_id IS NOT NULL
+            GROUP BY folder_id
+        ) fc ON fc.folder_id = f.id
+        LEFT JOIN (
+            SELECT parent_id AS pid, COUNT(*) AS cnt FROM folders
+            WHERE deleted_at IS NULL AND parent_id IS NOT NULL
+            GROUP BY parent_id
+        ) sc ON sc.pid = f.id
+        WHERE f.owner_id = ? AND f.deleted_at IS NOT NULL
+        ORDER BY f.deleted_at DESC, f.id DESC
+        "#,
     )
     .bind(owner_id)
     .fetch_all(pool)
     .await?;
 
     Ok(folders)
+}
+
+/// 回收站里的文件夹总数。与 [`list_trash_folders`] 条件一致，
+/// 用于在响应里给出总数（前端显示「共 N 项」）。
+///
+/// 文件夹不分页：一次查询能返回几百个目录的场景在本项目里不成立
+/// （交付场景下同一层目录通常是个位数），而给两个独立排序的列表各配一套游标
+/// 会让接口和前端状态机都复杂一倍。真正需要分页的是照片。
+pub async fn count_trash_folders(pool: &SqlitePool, owner_id: i64) -> Result<i64, AppError> {
+    let n: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM folders WHERE owner_id = ? AND deleted_at IS NOT NULL")
+            .bind(owner_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(n)
 }
 
 /// 永久删除回收站中的文件夹（及其子文件夹和文件）
@@ -298,8 +360,9 @@ pub async fn permanently_delete_folder(
 
     // 删除所有文件夹中的文件记录（物理文件交由 GC 处理）
     for fid in &folder_ids {
-        sqlx::query("DELETE FROM files WHERE folder_id = ?")
+        sqlx::query("DELETE FROM files WHERE folder_id = ? AND owner_id = ?")
             .bind(fid)
+            .bind(owner_id)
             .execute(&mut *tx)
             .await?;
     }
@@ -377,18 +440,29 @@ pub async fn create_folder(
 }
 
 /// 获取文件夹的面包屑导航路径
+///
+/// `owner_id` 不是可选的：面包屑沿着 parent_id 一路向上，**中途任何一跳
+/// 都不能跨用户**。少了它，任意登录用户只要构造 `parent_id=<他人文件夹ID>`
+/// 就能拿到对方整条祖先链（文件夹名在交付场景里常含客户姓名），
+/// 而 folders.id 是稠密自增整数，遍历成本几乎为零。
+/// 归属不符时返回空 vec——与 `list_folders`「查不到就是查不到」的语义一致，
+/// 不区分「不存在」和「不属于你」，避免变成归属探测工具。
 pub async fn get_breadcrumbs(
     pool: &SqlitePool,
+    owner_id: i64,
     folder_id: i64,
 ) -> Result<Vec<Folder>, AppError> {
     let mut breadcrumbs = Vec::new();
     let mut current_id = Some(folder_id);
 
     while let Some(cid) = current_id {
-        let folder = sqlx::query_as::<_, Folder>("SELECT * FROM folders WHERE id = ? AND deleted_at IS NULL")
-            .bind(cid)
-            .fetch_optional(pool)
-            .await?;
+        let folder = sqlx::query_as::<_, Folder>(
+            "SELECT * FROM folders WHERE id = ? AND owner_id = ? AND deleted_at IS NULL",
+        )
+        .bind(cid)
+        .bind(owner_id)
+        .fetch_optional(pool)
+        .await?;
 
         if let Some(f) = folder {
             current_id = f.parent_id;

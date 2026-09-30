@@ -45,10 +45,30 @@ impl Config {
         let jwt_secret_key_file = std::env::var("JWT_SECRET_KEY_FILE")
             .unwrap_or_else(|_| "./.secret_key".into());
         let jwt_secret_str = std::fs::read_to_string(&jwt_secret_key_file)
-            .unwrap_or_else(|_| panic!(
-                "在 '{}' 未找到 JWT 密钥文件。请创建一个包含安全随机字符串的文件。",
-                jwt_secret_key_file
-            ))
+            .unwrap_or_else(|e| {
+                // 刻意不在提示里嵌套引号：这段是让人直接复制到终端执行的，
+                // 带转义反斜杠的引号粘进 shell 会报错。
+                let docker_cmd =
+                    "docker compose exec app sh -c 'head -c 48 /dev/urandom | base64 > /data/secret.key'";
+                let host_cmd = format!(
+                    "openssl rand -base64 48 > {}",
+                    jwt_secret_key_file
+                );
+                panic!(
+                    "在 '{}' 未找到 JWT 密钥文件（{}）。\n\
+                     \n\
+                     容器部署：\n  {}\n\
+                     \n\
+                     裸机部署：\n  {}\n\
+                     \n\
+                     该文件内容需至少 32 字节，且应与数据库一起备份——\
+                     丢失它会让所有已签发的 JWT 立即失效。",
+                    jwt_secret_key_file,
+                    e,
+                    docker_cmd,
+                    host_cmd
+                )
+            })
             .trim()
             .to_string();
         if jwt_secret_str.len() < 32 {

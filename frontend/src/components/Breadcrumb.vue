@@ -7,6 +7,8 @@ defineProps({
   },
 })
 const emit = defineEmits(['navigate'])
+// 图标：Breadcrumb 只负责渲染，图标来自统一的 AppIcon（见 src/icons.js）
+import AppIcon from './AppIcon.vue'
 </script>
 
 <template>
@@ -16,13 +18,15 @@ const emit = defineEmits(['navigate'])
       :class="{ active: !path.length }"
       @click="emit('navigate', { id: null, name: '全部文件' })"
     >
-      🏠 全部文件
+      <AppIcon name="Files" size="sm" />
+      全部文件
     </button>
     <template v-for="(item, i) in path" :key="item.id ?? `p${i}`">
       <span class="sep" aria-hidden="true">/</span>
       <button
         class="crumb"
         :class="{ active: i === path.length - 1 }"
+        :title="item.name"
         @click="emit('navigate', item)"
       >
         {{ item.name }}
@@ -49,6 +53,7 @@ const emit = defineEmits(['navigate'])
   min-height: 36px;
   display: inline-flex;
   align-items: center;
+  gap: 6px;
   transition: background-color 0.15s ease, color 0.15s ease;
   max-width: 220px;
   overflow: hidden;

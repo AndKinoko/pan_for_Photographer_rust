@@ -1,6 +1,7 @@
 <script setup>
 import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { useTransfer } from '../composables/useTransfer'
+import AppIcon from './AppIcon.vue'
 
 const props = defineProps({
   folderId: { type: [Number, String, null], default: null },
@@ -84,7 +85,7 @@ defineExpose({ addFiles, openPicker })
       <Transition name="dz-fade">
         <div v-if="dragging" class="drop-overlay">
           <div class="drop-hint">
-            <span class="dz-icon">⬆️</span>
+            <AppIcon class="dz-icon" name="Upload" size="lg" />
             <strong>松开鼠标，上传到当前文件夹</strong>
           </div>
         </div>
@@ -104,7 +105,7 @@ defineExpose({ addFiles, openPicker })
 .drop-overlay {
   position: fixed;
   inset: 0;
-  z-index: 125;
+  z-index: var(--z-dropzone);
   background: var(--primary-soft);
   display: flex;
   align-items: center;
@@ -124,7 +125,7 @@ defineExpose({ addFiles, openPicker })
   box-shadow: var(--shadow-lg);
 }
 .dz-icon {
-  font-size: 1.8rem;
+  color: var(--primary);
 }
 .dz-fade-enter-active,
 .dz-fade-leave-active {

@@ -8,6 +8,12 @@ pub async fn init_db(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     sqlx::query("PRAGMA journal_mode=WAL;")
         .execute(&pool)
         .await?;
+    // 外键约束是**连接级**设置（SQLite 默认关），必须显式开，
+    // 否则删用户时 ON DELETE CASCADE 不触发，其名下文件会变成孤儿记录。
+    //
+    // 必要性说明：sqlx 的 SqliteConnectOptions 默认已带 foreign_keys=ON，
+    // 这里显式再设一次是冗余但无害的保险 —— 万一将来换用裸连接或
+    // 其它 pool 实现，行为不会静默改变。
     sqlx::query("PRAGMA foreign_keys=ON;")
         .execute(&pool)
         .await?;
@@ -126,6 +132,14 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .await
         .ok();
 
+    // 预览生成尝试次数：GC 每次重投前自增，达到上限后不再重投。
+    // 必要性：生成失败时 preview_path 保持 NULL，若不记次数，GC 会每轮（默认 600s）
+    // 重新解码同一个文件；配合 RAW 全量读盘会变成周期性 OOM（见 sweeper.rs）。
+    sqlx::query("ALTER TABLE files ADD COLUMN preview_attempts INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await
+        .ok();
+
     // 分享：文件夹分享支持
     sqlx::query("ALTER TABLE file_shares ADD COLUMN folder_id INTEGER REFERENCES folders(id) ON DELETE CASCADE")
         .execute(pool)
@@ -140,6 +154,40 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 
     // 分享：自定义分享码
     sqlx::query("ALTER TABLE file_shares ADD COLUMN custom_code TEXT")
+        .execute(pool)
+        .await
+        .ok();
+
+    // === 注册邀请码 ===
+    //
+    // 注册改为邀请制：公开注册接口在公网上是磁盘 DoS 的入口
+    // （新用户默认 5GB 配额，无限注册 = 无限占盘），且交付场景本来
+    // 就应该是「摄影师发邀请码给客户」，而不是任何人都能注册。
+    //
+    // code 存明文而非哈希：它不是密码，而是要**抄给客户、发在聊天里**的凭据，
+    // 摄影师需要在列表里重新看到它。真正的边界是「谁能拿到码」，
+    // 而这张表只有管理员能读。
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS invite_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL UNIQUE,
+            created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+            expires_at DATETIME,
+            max_uses INTEGER NOT NULL DEFAULT 1,
+            used_count INTEGER NOT NULL DEFAULT 0,
+            used_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            used_at DATETIME,
+            note TEXT NOT NULL DEFAULT ''
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // 管理员在用户列表里常按用户名排序，登记「谁用了码」要能反查
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_invite_used_by ON invite_codes(used_by)")
         .execute(pool)
         .await
         .ok();
@@ -161,6 +209,44 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await
         .ok();
+
+    // 游标分页（keyset）需要的复合索引。
+    //
+    // 单列索引（owner_id / folder_id / deleted_at）对分页查询没用：分页的 WHERE 是
+    // 「owner + 目录 + 未删除」再叠加游标条件，ORDER BY 是「排序键, id」，
+    // 只有列顺序完全对上的复合索引才能既过滤又直接按序取值，省掉一次排序。
+    //
+    // 用**部分索引**（`WHERE deleted_at IS NULL` / `IS NOT NULL`）而不是把 deleted_at
+    // 放进列里：列表页永远只关心其中一种，部分索引体积更小、写放大更低，
+    // SQLite 要求索引的 WHERE 被查询的 WHERE 蕴含，而查询里恰好就是字面量
+    // `deleted_at IS NULL`，能匹配上。
+    //
+    // 这几条只新增、不删旧的：我没有 `EXPLAIN QUERY PLAN` 可跑，
+    // 无法确认新索引覆盖了全部访问路径，先并存观察；等有了查询计划再清理冗余。
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_files_page_folder ON files(owner_id, folder_id, uploaded_at DESC, id DESC) WHERE deleted_at IS NULL",
+    )
+    .execute(pool)
+    .await
+    .ok();
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_files_page_root ON files(owner_id, uploaded_at DESC, id DESC) WHERE deleted_at IS NULL",
+    )
+    .execute(pool)
+    .await
+    .ok();
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_files_page_trash ON files(owner_id, deleted_at DESC, id DESC) WHERE deleted_at IS NOT NULL",
+    )
+    .execute(pool)
+    .await
+    .ok();
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_folders_page_trash ON folders(owner_id, deleted_at DESC, id DESC) WHERE deleted_at IS NOT NULL",
+    )
+    .execute(pool)
+    .await
+    .ok();
 
     tracing::info!("数据库迁移完成");
     Ok(())
@@ -226,6 +312,7 @@ pub async fn seed_admin_with(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use std::path::PathBuf;
 
@@ -282,7 +369,7 @@ mod tests {
             .await
             .unwrap();
         let file_cols: Vec<&str> = file_cols.iter().map(|(n,)| n.as_str()).collect();
-        for expected in ["thumb_path", "deleted_at"] {
+        for expected in ["thumb_path", "deleted_at", "preview_attempts"] {
             assert!(file_cols.contains(&expected), "files 缺少列 {}", expected);
         }
 
@@ -294,6 +381,23 @@ mod tests {
         let share_cols: Vec<&str> = share_cols.iter().map(|(n,)| n.as_str()).collect();
         for expected in ["folder_id", "max_downloads", "custom_code"] {
             assert!(share_cols.contains(&expected), "file_shares 缺少列 {}", expected);
+        }
+
+        // 游标分页的复合索引。缺了它们分页仍然正确，但会退化成全表排序，
+        // 而分页的全部意义就是别在大目录上做全量排序，所以这里锁住。
+        let indexes: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'index'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let indexes: Vec<&str> = indexes.iter().map(|(n,)| n.as_str()).collect();
+        for expected in [
+            "idx_files_page_folder",
+            "idx_files_page_root",
+            "idx_files_page_trash",
+            "idx_folders_page_trash",
+        ] {
+            assert!(indexes.contains(&expected), "缺少索引 {}", expected);
         }
 
         cleanup(pool, path).await;
@@ -354,4 +458,5 @@ mod tests {
 
         cleanup(pool, path).await;
     }
+
 }

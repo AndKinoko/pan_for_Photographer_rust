@@ -22,6 +22,10 @@ import UploadZone from '../components/UploadZone.vue'
 import ShareDialog from '../components/ShareDialog.vue'
 import BatchToolbar from '../components/BatchToolbar.vue'
 import Breadcrumb from '../components/Breadcrumb.vue'
+import AppIcon from '../components/AppIcon.vue'
+import LoadMore from '../components/LoadMore.vue'
+import { useModal } from '../composables/useModal'
+import { useProgressiveList } from '../composables/useProgressiveList'
 
 const route = useRoute()
 const router = useRouter()
@@ -34,10 +38,34 @@ const currentFolderId = computed(() =>
   breadcrumb.value.length ? breadcrumb.value[breadcrumb.value.length - 1].id : null
 )
 
-const files = ref([])
-const folders = ref([])
+/* 服务端游标分页状态机。
+   `files` 是**已加载**的文件（跨页累积），`fileTotal` 是服务端报告的该目录文件总数。
+   两者不可混用：列表标题要显示 total，v-for 要遍历 items。 */
+const {
+  items: files,
+  folders,
+  total: fileTotal,
+  totalFolders,
+  hasMore: hasMoreFiles,
+  loadingMore,
+  error: pageError,
+  loadFirst: loadFirstPage,
+  loadMore: loadMoreFiles,
+  reset: resetPaging,
+  setFolders,
+  removeFile,
+  removeFolder,
+} = useProgressiveList(({ limit, cursor }) =>
+  listFiles(currentFolderId.value, { limit, cursor })
+)
 const loading = ref(false)
 const errorMsg = ref('')
+
+/* 还有多少项没加载出来。用于把「全选」的语义讲清楚：
+   分页之后客户端手里只有已加载的那些，全选不可能覆盖没取回来的部分。 */
+const unloadedCount = computed(() =>
+  Math.max(0, fileTotal.value - files.value.length)
+)
 
 const CRUMB_KEY = 'pan_crumb'
 function persistCrumb() {
@@ -72,17 +100,19 @@ async function load() {
   // 重新加载列表时丢弃全选快照（item id 集合已变）
   preSelectAllSnapshot.value = null
   try {
-    const [f, d] = await Promise.all([
-      listFiles(currentFolderId.value),
+    // 文件走分页接口，文件夹仍由 /api/folders 整体返回（后端不分页文件夹）
+    const [, d] = await Promise.all([
+      loadFirstPage(),
       listFolders(currentFolderId.value),
     ])
-    files.value = f || []
     // 后端 /api/folders 返回 { folders, breadcrumbs }
-    folders.value = d?.folders || []
+    setFolders(d?.folders || [])
+    // loadFirstPage 自己吞掉错误并写进 pageError（那样「加载更多」失败时
+    // 列表不必被清空），这里把它抬到页面的错误态上
+    errorMsg.value = pageError.value
   } catch (e) {
     errorMsg.value = e.message || '加载失败'
-    files.value = []
-    folders.value = []
+    resetPaging()
   } finally {
     loading.value = false
   }
@@ -113,6 +143,10 @@ function clearSelection() {
   selectedFolders.value = new Set()
   preSelectAllSnapshot.value = null // 清空时也丢弃快照
 }
+/* 全选。
+   注意作用域是**已加载的项**：分页之后客户端只有已取回的那些 id，
+   服务端也没有「按目录全选」的接口。按钮的 title 会把这一点讲明
+   （见 unloadedCount），而不是让用户以为选了整个目录。 */
 function selectAll() {
   selectedFiles.value = new Set(files.value.map((f) => f.id))
   selectedFolders.value = new Set(folders.value.map((f) => f.id))
@@ -122,11 +156,11 @@ function selectAll() {
  *  当用户再点"已全选"时，恢复到该快照，而不是清空。 */
 const preSelectAllSnapshot = ref(null)
 
-/** 当前文件夹下所有可选项（文件 + 文件夹）数量 */
+/** 当前**已加载**的可选项（文件 + 文件夹）数量 —— 全选的作用域就是它 */
 const selectableCount = computed(
   () => files.value.length + folders.value.length
 )
-/** 是否已全选当前文件夹下所有可选项 */
+/** 是否已全选当前已加载的所有可选项 */
 const isAllSelected = computed(
   () =>
     selectableCount.value > 0 &&
@@ -270,8 +304,10 @@ function startThumbPolling() {
   const deadline = Date.now() + 15000 // 兜底超时，避免无限轮询
   uploadPoller = setInterval(async () => {
     try {
-      const list = (await listFiles(currentFolderId.value)) || []
-      const map = new Map(list.map((f) => [f.id, f]))
+      // 只取第一页：新上传的文件时间戳最新、排在列表最前面，必然在里面。
+      // 分页之前这里会把整个目录拉一遍，现在只传 100 条。
+      const page = await listFiles(currentFolderId.value, { limit: 100 })
+      const map = new Map((page.files || []).map((f) => [f.id, f]))
       for (const id of Array.from(uploadPendingIds)) {
         const nf = map.get(id)
         if (nf && nf.preview_url) {
@@ -393,6 +429,25 @@ const moveTargetId = computed(() =>
     ? moveState.value.crumbs[moveState.value.crumbs.length - 1].id
     : null
 )
+/* 两个对话框各挂一套焦点陷阱。
+   原先「新建文件夹」靠输入框自动聚焦才碰巧能收 Esc/Enter；
+   移动/复制对话框则完全收不到键盘事件，且打开时 Tab 会走到背后的文件卡片上。 */
+const newFolderDialogEl = ref(null)
+const moveDialogEl = ref(null)
+
+useModal(() => showNewFolder.value, {
+  container: newFolderDialogEl,
+  onClose: () => {
+    showNewFolder.value = false
+  },
+})
+useModal(() => moveState.value.open, {
+  container: moveDialogEl,
+  onClose: () => {
+    moveState.value.open = false
+  },
+})
+
 async function loadMoveFolders(parentId) {
   moveState.value.loading = true
   try {
@@ -494,15 +549,21 @@ onMounted(() => {
 
 <template>
   <div class="home">
+    <!-- 桌面端此前没有 h1：唯一的 h1 在移动端顶栏且 display:none，
+         文档层级直接从 h2（「文件夹」「文件」）开始。 -->
+    <h1 class="sr-only">我的文件</h1>
+
     <div class="toolbar card">
       <Breadcrumb :path="breadcrumb" @navigate="navigateTo" />
       <div class="actions">
-        <button class="btn btn-sm" @click="openNewFolder">＋ 新建文件夹</button>
+        <button class="btn btn-sm" @click="openNewFolder">
+          <AppIcon name="FolderPlus" size="sm" /> 新建文件夹
+        </button>
         <button
           class="btn btn-sm btn-ghost"
           @click="uploadRef?.openPicker()"
         >
-          ⬆️ 上传
+          <AppIcon name="Upload" size="sm" /> 上传
         </button>
       </div>
     </div>
@@ -529,7 +590,7 @@ onMounted(() => {
 
     <!-- Error -->
     <div v-else-if="errorMsg" class="state">
-      <span class="emoji">⚠️</span>
+      <AppIcon class="state-icon" name="CircleAlert" size="xl" />
       <h3>加载失败</h3>
       <p>{{ errorMsg }}</p>
       <button class="btn btn-primary btn-sm" @click="load">重试</button>
@@ -540,11 +601,11 @@ onMounted(() => {
       v-else-if="!folders.length && !files.length"
       class="state"
     >
-      <span class="emoji">📂</span>
+      <AppIcon class="state-icon" name="FolderOpen" size="xl" />
       <h3>此文件夹为空</h3>
       <p>上传文件或新建文件夹来开始管理</p>
       <button class="btn btn-primary btn-sm" @click="uploadRef?.openPicker()">
-        ⬆️ 上传文件
+        <AppIcon name="Upload" size="sm" /> 上传文件
       </button>
     </div>
 
@@ -569,7 +630,9 @@ onMounted(() => {
       </div>
 
       <div v-if="files.length" class="section">
-        <h2 class="sec-title">文件 ({{ files.length }})</h2>
+        <!-- 标题显示服务端报告的**总数**，不是已加载数：
+             否则用户会以为目录里只有 100 张 -->
+        <h2 class="sec-title">文件 ({{ fileTotal }})</h2>
         <div class="grid">
           <FileCard
             v-for="f in files"
@@ -587,12 +650,27 @@ onMounted(() => {
           />
         </div>
       </div>
+
+      <LoadMore
+        :has-more="hasMoreFiles"
+        :loaded="files.length"
+        :total="fileTotal"
+        :loading="loadingMore"
+        @more="loadMoreFiles"
+      />
     </template>
 
     <!-- New folder dialog -->
     <Transition name="fade">
       <div v-if="showNewFolder" class="overlay" @mousedown.self="showNewFolder = false">
-        <div class="dialog card" role="dialog" aria-modal="true" @keydown.enter="createNewFolder" @keydown.esc="showNewFolder = false">
+        <div
+          ref="newFolderDialogEl"
+          class="dialog card"
+          role="dialog"
+          aria-modal="true"
+          tabindex="-1"
+          @keydown.enter="createNewFolder"
+        >
           <h3>新建文件夹</h3>
           <input
             ref="newFolderEl"
@@ -612,14 +690,26 @@ onMounted(() => {
     <!-- Move / Copy dialog -->
     <Transition name="fade">
       <div v-if="moveState.open" class="overlay" @mousedown.self="moveState.open = false">
-        <div class="dialog move-dialog card" role="dialog" aria-modal="true">
+        <div
+          ref="moveDialogEl"
+          class="dialog move-dialog card"
+          role="dialog"
+          aria-modal="true"
+          tabindex="-1"
+        >
           <div class="row between">
             <h3>{{ moveState.mode === 'move' ? '移动到' : '复制到' }}</h3>
-            <button class="btn-icon btn-ghost" @click="moveState.open = false">✕</button>
+            <button
+              class="btn-icon btn-ghost"
+              aria-label="关闭"
+              @click="moveState.open = false"
+            >
+              <AppIcon name="X" size="sm" />
+            </button>
           </div>
           <div class="move-crumb">
             <button class="crumb-link" :class="{ active: !moveState.crumbs.length }" @click="moveToRoot">
-              🏠 根目录
+              <AppIcon name="Files" size="sm" /> 根目录
             </button>
             <template v-for="(c, i) in moveState.crumbs" :key="c.id">
               <span class="sep">/</span>
@@ -637,8 +727,8 @@ onMounted(() => {
             </div>
             <ul v-else>
               <li v-for="f in moveState.folders" :key="f.id" @dblclick="moveEnter(f)" @click="moveEnter(f)">
-                <span class="emoji">📁</span>
-                <span class="truncate">{{ f.name }}</span>
+                <AppIcon class="folder-ico" name="Folder" size="md" />
+                <span class="truncate" :title="f.name">{{ f.name }}</span>
                 <span class="muted small">{{ f.file_count }} / {{ f.subfolder_count }}</span>
               </li>
             </ul>
@@ -681,6 +771,7 @@ onMounted(() => {
       :folder-selected-count="selectedFolders.size"
       :selectable-count="selectableCount"
       :is-all-selected="isAllSelected"
+      :unloaded-count="unloadedCount"
       @move="openMoveCopy('move')"
       @copy="openMoveCopy('copy')"
       @delete="onBatchDelete"
@@ -698,6 +789,9 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  /* 选中态下由 BatchToolbar 把 --batch-bar-offset 设为批量条的高度，
+     让最后一行能滚到批量条上方。未选中时为 0。 */
+  padding-bottom: var(--batch-bar-offset, 0px);
 }
 .toolbar {
   display: flex;
@@ -756,9 +850,10 @@ onMounted(() => {
   align-items: center;
   justify-content: center;
   padding: 20px;
-  z-index: 8500;
+  z-index: var(--z-modal);
 }
 .dialog {
+  outline: none;
   width: min(92vw, 420px);
   background: var(--bg-elevated);
   padding: 22px;
@@ -830,8 +925,8 @@ onMounted(() => {
 .move-list li:hover {
   background: var(--bg-hover);
 }
-.move-list .emoji {
-  font-size: 1.2rem;
+.move-list .folder-ico {
+  color: var(--primary);
 }
 .small {
   font-size: 0.74rem;

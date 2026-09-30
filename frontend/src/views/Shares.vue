@@ -8,6 +8,7 @@ import {
   fileIcon,
   formatDate,
 } from '../api'
+import AppIcon from '../components/AppIcon.vue'
 import { useToast } from '../composables/useToast'
 import { confirm } from '../composables/useConfirm'
 
@@ -95,11 +96,11 @@ onMounted(load)
   <div class="shares">
     <div class="head">
       <div>
-        <h2>我的分享</h2>
+        <h1>我的分享</h1>
         <p class="muted">共 {{ shares.length }} 个分享，{{ activeCount }} 个有效</p>
       </div>
       <button class="btn btn-sm btn-primary" @click="router.push('/')">
-        🗂️ 去文件管理创建分享
+        <AppIcon name="Files" size="sm" /> 去文件管理创建分享
       </button>
     </div>
 
@@ -112,14 +113,14 @@ onMounted(load)
     </div>
 
     <div v-else-if="error" class="state">
-      <span class="emoji">⚠️</span>
+      <AppIcon class="state-icon" name="CircleAlert" size="xl" />
       <h3>加载失败</h3>
       <p>{{ error }}</p>
       <button class="btn btn-primary btn-sm" @click="load">重试</button>
     </div>
 
     <div v-else-if="!shares.length" class="state">
-      <span class="emoji">🔗</span>
+      <AppIcon class="state-icon" name="Link" size="xl" />
       <h3>还没有分享</h3>
       <p>在文件管理中选择文件即可创建分享链接</p>
     </div>
@@ -139,7 +140,12 @@ onMounted(load)
               alt=""
               @error="$event.target.style.display = 'none'"
             />
-            <span v-else class="emoji">{{ fileIcon(s.file_type, s.file_name) }}</span>
+            <AppIcon
+              v-else
+              class="file-icon"
+              :name="fileIcon(s.file_type, s.file_name)"
+              size="lg"
+            />
           </span>
           <div class="meta">
             <div class="name truncate" :title="s.file_name">{{ s.file_name }}</div>
@@ -150,7 +156,9 @@ onMounted(load)
               <span v-if="s.is_expired" class="badge badge-danger">已过期</span>
               <span v-else-if="!s.is_active" class="badge badge-muted">已停用</span>
               <span v-else class="badge">有效</span>
-              <span v-if="s.has_password" class="badge badge-muted">🔒 加密</span>
+              <span v-if="s.has_password" class="badge badge-muted">
+                <AppIcon name="Lock" size="sm" /> 加密
+              </span>
             </div>
           </div>
         </div>
@@ -166,7 +174,9 @@ onMounted(load)
         </div>
 
         <div class="actions">
-          <button class="btn btn-sm grow" @click="copyLink(s)">📋 复制链接</button>
+          <button class="btn btn-sm grow" @click="copyLink(s)">
+            <AppIcon name="Copy" size="sm" /> 复制链接
+          </button>
           <button class="btn btn-sm btn-ghost" @click="openShare(s)">查看</button>
           <button class="btn btn-sm btn-danger" @click="onDelete(s)">删除</button>
         </div>
@@ -188,7 +198,7 @@ onMounted(load)
   gap: 12px;
   flex-wrap: wrap;
 }
-.head h2 {
+.head h1 {
   font-size: 1.15rem;
 }
 .grid {
@@ -230,8 +240,8 @@ onMounted(load)
   height: 100%;
   object-fit: cover;
 }
-.thumb .emoji {
-  font-size: 1.6rem;
+.thumb .file-icon {
+  color: var(--text-muted);
 }
 .meta {
   flex: 1 1 auto;

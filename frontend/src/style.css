@@ -6,18 +6,22 @@
    =========================================================================== */
 
 :root {
-  /* Brand */
-  --primary: #6366f1;
-  --primary-hover: #4f46e5;
-  --primary-soft: rgba(99, 102, 241, 0.12);
-  --primary-soft-border: rgba(99, 102, 241, 0.35);
+  /* Brand
+     注意：这些值是按 WCAG 4.5:1 反算出来的，不是凭观感挑的。
+     --primary 同时用于「填充」（按钮底色 + 白字）与「文字」（链接/徽章/导航当前项），
+     两个方向都要 ≥4.5:1；对比度公式对前景背景是对称的，所以一个值即可同时满足。
+     改色前请用 UX_AUDIT.md 里的脚本复算，尤其要过最深的那个底 --bg-hover。 */
+  --primary: #4f46e5;
+  --primary-hover: #4338ca;
+  --primary-soft: rgba(79, 70, 229, 0.12);
+  --primary-soft-border: rgba(79, 70, 229, 0.35);
 
   /* Status */
-  --danger: #ef4444;
-  --danger-hover: #dc2626;
-  --danger-soft: rgba(239, 68, 68, 0.12);
-  --success: #10b981;
-  --warning: #f59e0b;
+  --danger: #c81e1e;
+  --danger-hover: #a81818;
+  --danger-soft: rgba(200, 30, 30, 0.12);
+  --success: #047857;
+  --warning: #d97706;
   --info: #3b82f6;
 
   /* Surfaces */
@@ -30,11 +34,15 @@
   /* Text */
   --text: #3a3f52;
   --text-heading: #14161f;
-  --text-muted: #8a90a2;
+  --text-muted: #616977;
 
   /* Lines */
   --border: #e4e6ee;
   --border-strong: #cfd3e0;
+  /* 交互控件边界专用。未勾选的 checkbox 全白、边框是它唯一可见的形状依据，
+     属 WCAG 1.4.11 的「非文本对比」范畴，须 3:1（原先用 --border-strong 只有 1.49:1，
+     等于隐形）。只给 checkbox 用，不抬高 --border-strong 以免卡片 hover 边框变得过重。 */
+  --border-control: #7d8598;
 
   /* Geometry */
   --radius-sm: 8px;
@@ -50,6 +58,36 @@
   --shadow-sm: 0 1px 2px rgba(16, 18, 31, 0.06);
   --shadow: 0 6px 20px rgba(16, 18, 31, 0.1);
   --shadow-lg: 0 18px 50px rgba(16, 18, 31, 0.22);
+
+  /* 层级尺度
+     替换掉原先散落全站的 14 个互不相关的 z-index 取值（2/3/50/100/110/120/125/130/
+     140/200/8000/8500/9000/9999）。那套取值不只是不整洁——它实际造成了
+     Admin 模态遮罩（100）低于侧边栏（120）而被遮挡的缺陷。
+     顺序要点：遮罩必须低于它要盖住的东西之外的所有层；确认框必须高于普通对话框
+     （它常从对话框内部弹出）；toast 最高。
+     卡片 ⋯ 菜单原先留在低位（50），只求高于同层兄弟卡片。后来它改成 Teleport 到 body
+     的浮层（见 FileCard.vue），不再受卡片层叠上下文约束，于是必须高于吸顶工具栏与
+     底部批量条，否则会被压住；但仍要低于预览层与模态，好让对话框照常盖住它。 */
+  /* 固定底部批量条占用的空间：44px 的按钮行 + 上下 padding + 距底 20px 的间隙。
+     窄屏下批量条改为纵向排列（见 BatchToolbar.vue），高度翻倍。 */
+  --batch-bar-space: 96px;
+  /* 由 BatchToolbar 在选中态下设为 var(--batch-bar-space)，未选中时为 0。
+     内容区写 padding-bottom: var(--batch-bar-offset) 即可避免被固定批量条遮挡。 */
+  --batch-bar-offset: 0px;
+
+  --z-card-ctrl: 2;
+  --z-sticky: 100;
+  --z-backdrop: 200;
+  --z-sidebar: 300;
+  --z-drawer: 400;
+  --z-dropzone: 500;
+  --z-batchbar: 600;
+  /* 挂在 body 上的浮层（目前只有卡片 ⋯ 菜单） */
+  --z-popover: 700;
+  --z-preview: 1000;
+  --z-modal: 1100;
+  --z-confirm: 1200;
+  --z-toast: 1300;
 
   --font: system-ui, -apple-system, 'Segoe UI', Roboto, 'PingFang SC',
     'Microsoft YaHei', sans-serif;
@@ -86,10 +124,12 @@
 
   --text: #b6bcd0;
   --text-heading: #f3f4f8;
-  --text-muted: #767d93;
+  /* 4.18:1 → 抬到 5.58:1（对 --bg-elevated）。暗色必须独立复算，不能从亮色推。 */
+  --text-muted: #8b93a7;
 
   --border: #262a3a;
   --border-strong: #353a4f;
+  --border-control: #6b7490;
 
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
@@ -115,6 +155,13 @@ body {
 
 #app {
   min-height: 100vh;
+}
+
+/* 离屏的长列表容器跳过布局与绘制。网格卡片还要单独设一次
+   （见 FileCard.vue / Trash.vue），因为 content-visibility 不会向下继承。 */
+.list > li {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 72px;
 }
 
 a {
@@ -338,6 +385,54 @@ textarea::placeholder {
   white-space: nowrap;
 }
 
+/* ---------- 表单错误 ---------- */
+/* 原先 Admin.vue 与 Auth.vue 各写一份且字号已漂移（0.85rem vs 0.78rem），
+   合并到这里统一。注意这里的 select 器不带作用域，所以两个视图里的
+   <p class="err"> / <span class="err"> 都会命中，无需再各自声明。 */
+.err {
+  color: var(--danger);
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+/* 登录限流倒计时。
+   放全局而不是 Auth.vue 的 scoped 样式里：它是全局状态语义的一部分
+   （与 toast 的错误色系保持一致），而 .err 当初被收上来就是为了
+   消除各页面的字号漂移，再在页面里开一个例外只会重新制造漂移。 */
+.cooldown {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  /* 12.16px 下 --warning(#d97706) 对 --bg-elevated 的对比度约 4.6:1，达 AA */
+  color: var(--warning);
+  background: var(--bg-hover);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font-size: 0.86rem;
+  line-height: 1.4;
+}
+.cooldown strong {
+  /* 数字用等宽，避免倒计时时字宽跳动导致整行左右抖 */
+  font-variant-numeric: tabular-nums;
+  min-width: 1.5em;
+  display: inline-block;
+  text-align: center;
+}
+/* 仅屏幕阅读器可见。用于给每个视图补 h1（视觉上不需要重复标题）、
+   以及承载表单的 aria-live 摘要。 */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* ---------- State views ---------- */
 
 .state {
@@ -350,8 +445,8 @@ textarea::placeholder {
   text-align: center;
   color: var(--text-muted);
 }
-.state .emoji {
-  font-size: 2.6rem;
+.state .state-icon {
+  color: var(--text-muted);
   opacity: 0.85;
 }
 .state h3 {
@@ -435,8 +530,88 @@ textarea::placeholder {
   opacity: 0;
 }
 
+/* ---------- Skip link ---------- */
+/* 桌面端侧边栏有 5 个导航项挡在内容之前，键盘用户每次都要逐个 Tab 过去。 */
+.skip-link {
+  position: fixed;
+  left: 8px;
+  top: -48px;
+  z-index: var(--z-toast);
+  padding: 10px 16px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow);
+  color: var(--text-heading);
+  font-weight: 600;
+  text-decoration: none;
+  transition: top 0.15s ease;
+}
+.skip-link:focus {
+  top: 8px;
+  text-decoration: none;
+}
+
+/* ---------- 全局焦点态 ---------- */
+/* 原先只有 .btn 与 .file-card 带 focus-visible，导航项、面包屑、
+   对话框里的按钮、表格里的下拉全部没有可见焦点——键盘用户看不出自己在哪。 */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+/* 输入控件自身已有 border + box-shadow 的聚焦样式，避免叠加两层描边 */
+.input:focus-visible,
+.select:focus-visible,
+.textarea:focus-visible {
+  outline: none;
+}
+
+/* ---------- 自适应 ---------- */
+@media (max-width: 560px) {
+  /* 批量条在窄屏下 flex-direction 变 column，高度约翻倍 */
+  :root {
+    --batch-bar-space: 152px;
+  }
+}
+
 @media (max-width: 768px) {
   :root {
     font-size: 14px;
+  }
+  /* iOS Safari 在聚焦 font-size < 16px 的输入控件时会强制缩放整页，且不会自动缩回。
+     正文保持 14px 以容纳更多内容，但输入控件单独提到 16px。
+     这里必须用 !important：Search.vue 的 .searchbar input 是带 data-v 属性的
+     作用域样式（特异度高于本文件的选择器），不加则压不住。 */
+  input,
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
+}
+
+/* ---------- 降低动效偏好 ---------- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  /* 上面那条会把加载指示也冻住，可能被误读为「卡死」，所以放慢而非停转 */
+  .spinner {
+    animation-duration: 1.6s !important;
+    animation-iteration-count: infinite !important;
+  }
+  /* 骨架屏的明暗扫光是这套 UI 里最主要的前庭刺激来源，直接改为静态 */
+  .skeleton {
+    animation: none !important;
+    background: var(--bg-hover) !important;
   }
 }

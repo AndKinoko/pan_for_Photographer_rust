@@ -1,0 +1,64 @@
+# Docker 构建上下文排除项。
+#
+# 没有这一份，docker build 会把 target/（数 GB）与
+# frontend/node_modules/（数百 MB）发给构建器，构建会慢到不可接受。
+# 注意：static/ 也不在这里 —— 它是 .gitignore 的产物，
+# 镜像里由 Dockerfile 的 frontend 阶段现构建。
+
+# Rust
+/target
+**/*.rs.bk
+
+# Node
+/frontend/node_modules
+/frontend/.vite
+/frontend/dist
+
+# 构建产物（镜像内现构建）
+/static
+
+# 运行时数据 —— 绝不能进镜像
+/data
+/uploads
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# 密钥与本地配置
+.secret_key
+*.key
+*.pem
+deploy.env
+
+# 任意 .env（本地开发用的那套路径与 deploy.env 完全不同，
+# 混进镜像只会让人分不清哪份生效）
+.env
+**/.env
+!.env.example
+!**/.env.example
+
+# 版本控制与编辑器
+.git
+.gitignore
+.github
+.vscode
+.idea
+
+# 作者的验证脚本（需要 /proc，Windows 上会崩）
+.p0_e2e_verify.py
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# 备份与迁移快照：含真实用户数据与密码哈希，
+# 既不该进版本库，也不该进构建上下文（白白增大镜像层）。
+*.snapshot
+/backups
+/migrate_backup
+backups-*/
+
+# 废弃源码快照（测试回退验证的遗留）
+src/srcok

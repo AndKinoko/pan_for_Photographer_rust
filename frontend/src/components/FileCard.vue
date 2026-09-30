@@ -1,5 +1,7 @@
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { computed } from 'vue'
+import AppIcon from './AppIcon.vue'
+import { useCardMenu } from '../composables/useCardMenu'
 import {
   authUrl,
   fileIcon,
@@ -27,8 +29,16 @@ const emit = defineEmits([
   'permanent',
 ])
 
-const menuOpen = ref(false)
-const menuEl = ref(null)
+// ⋯ 菜单的浮层定位与全局监听都在这里——菜单装不进卡片，必须 Teleport 出去，
+// 所以它需要自己的坐标计算与滚动关闭策略。详见 useCardMenu.js 的说明。
+const {
+  open: menuOpen,
+  anchorEl,
+  menuEl,
+  pos: menuPos,
+  toggle,
+  hide: closeMenu,
+} = useCardMenu()
 
 const isFolder = computed(() => props.kind === 'folder')
 const isImg = computed(() =>
@@ -38,6 +48,7 @@ const thumbUrl = computed(() => {
   if (isFolder.value) return null
   return props.item.thumb_url || props.item.preview_url || null
 })
+
 const metaText = computed(() => {
   if (isFolder.value) {
     const hasCounts =
@@ -72,21 +83,13 @@ function onCheck(e) {
   emit('toggle-select', props.item)
 }
 function toggleMenu(e) {
-  e.stopPropagation()
-  menuOpen.value = !menuOpen.value
+  toggle(anchorEl.value, e)
 }
 function run(action, e) {
   e.stopPropagation()
-  menuOpen.value = false
+  closeMenu()
   emit(action, props.item)
 }
-function onDocClick(e) {
-  if (menuEl.value && !menuEl.value.contains(e.target)) {
-    menuOpen.value = false
-  }
-}
-onMounted(() => document.addEventListener('click', onDocClick))
-onBeforeUnmount(() => document.removeEventListener('click', onDocClick))
 </script>
 
 <template>
@@ -116,48 +119,71 @@ onBeforeUnmount(() => document.removeEventListener('click', onDocClick))
         alt=""
         @error="$event.target.style.display = 'none'"
       />
-      <span v-else class="emoji">{{ isFolder ? '📁' : fileIcon(item.file_type, item.name) }}</span>
+      <AppIcon
+        v-else
+        class="file-icon"
+        :name="isFolder ? 'Folder' : fileIcon(item.file_type, item.name)"
+        size="lg"
+      />
     </div>
 
     <div class="info">
       <div class="name truncate" :title="item.name">{{ item.name }}</div>
-      <div class="meta truncate">{{ metaText }}</div>
+      <div class="meta truncate" :title="metaText">{{ metaText }}</div>
       <div v-if="context === 'trash'" class="meta muted">
         删除于 {{ dateText }}
       </div>
     </div>
 
-    <div ref="menuEl" class="menu-wrap">
+    <div class="menu-wrap">
       <button
+        ref="anchorEl"
         class="menu-btn"
         :class="{ open: menuOpen }"
         aria-label="更多操作"
+        aria-haspopup="menu"
+        :aria-expanded="menuOpen"
         @click="toggleMenu"
       >
-        ⋯
+        <AppIcon name="MoreHorizontal" size="sm" />
       </button>
-      <Transition name="fade">
-        <div v-if="menuOpen" class="menu" role="menu" @click.stop>
-          <template v-if="context === 'browse'">
-            <button v-if="!isFolder" role="menuitem" @click="run('download', $event)">
-              ⬇️ 下载
-            </button>
-            <button role="menuitem" @click="run('rename', $event)">✏️ 重命名</button>
-            <button v-if="!isFolder" role="menuitem" @click="run('share', $event)">
-              🔗 分享
-            </button>
-            <button class="danger" role="menuitem" @click="run('remove', $event)">
-              🗑️ 删除
-            </button>
-          </template>
-          <template v-else>
-            <button role="menuitem" @click="run('restore', $event)">♻️ 恢复</button>
-            <button class="danger" role="menuitem" @click="run('permanent', $event)">
-              ⨯ 永久删除
-            </button>
-          </template>
-        </div>
-      </Transition>
+      <!-- Teleport 到 body：卡片带 overflow:hidden，菜单留在卡片里会被裁掉左边缘
+           和「删除」那一项。定位坐标由 useCardMenu 量锚点算出，走 menuPos。 -->
+      <Teleport to="body">
+        <Transition name="fade">
+          <div
+            v-if="menuOpen"
+            ref="menuEl"
+            class="menu"
+            role="menu"
+            :style="menuPos"
+            @click.stop
+          >
+            <template v-if="context === 'browse'">
+              <button v-if="!isFolder" role="menuitem" @click="run('download', $event)">
+                <AppIcon name="Download" size="sm" /> 下载
+              </button>
+              <button role="menuitem" @click="run('rename', $event)">
+                <AppIcon name="Pencil" size="sm" /> 重命名
+              </button>
+              <button v-if="!isFolder" role="menuitem" @click="run('share', $event)">
+                <AppIcon name="Link" size="sm" /> 分享
+              </button>
+              <button class="danger" role="menuitem" @click="run('remove', $event)">
+                <AppIcon name="Trash2" size="sm" /> 删除
+              </button>
+            </template>
+            <template v-else>
+              <button role="menuitem" @click="run('restore', $event)">
+                <AppIcon name="RotateCcw" size="sm" /> 恢复
+              </button>
+              <button class="danger" role="menuitem" @click="run('permanent', $event)">
+                <AppIcon name="Trash2" size="sm" /> 永久删除
+              </button>
+            </template>
+          </div>
+        </Transition>
+      </Teleport>
     </div>
   </div>
 </template>
@@ -165,6 +191,11 @@ onBeforeUnmount(() => document.removeEventListener('click', onDocClick))
 <style scoped>
 .file-card {
   position: relative;
+  /* 离屏卡片跳过布局与绘制。几千张照片时这是主线程压力的主要来源。
+     contain-intrinsic-size 带 auto 关键字，浏览器会记住真实高度，
+     滚动条不会因为估算值不准而跳动。 */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 240px;
   display: flex;
   flex-direction: column;
   background: var(--bg-elevated);
@@ -193,12 +224,12 @@ onBeforeUnmount(() => document.removeEventListener('click', onDocClick))
   position: absolute;
   top: 8px;
   left: 8px;
-  z-index: 2;
+  z-index: var(--z-card-ctrl);
   width: 26px;
   height: 26px;
   border-radius: 6px;
   background: var(--bg-elevated);
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--border-control);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -233,15 +264,17 @@ onBeforeUnmount(() => document.removeEventListener('click', onDocClick))
   object-fit: cover;
   display: block;
 }
-.thumb .emoji {
-  font-size: 2.6rem;
-  opacity: 0.9;
+
+/* 图标取代 emoji 后颜色可跟随主题：普通文件用弱化色，不抢缩略图的视觉权重；
+   文件夹用品牌色以示区分。 */
+.thumb .file-icon {
+  color: var(--text-muted);
 }
 .file-card.folder .thumb {
   background: var(--primary-soft);
 }
-.file-card.folder .thumb .emoji {
-  font-size: 3rem;
+.file-card.folder .thumb .file-icon {
+  color: var(--primary);
 }
 
 .info {
@@ -267,17 +300,15 @@ onBeforeUnmount(() => document.removeEventListener('click', onDocClick))
   position: absolute;
   top: 6px;
   right: 6px;
-  z-index: 3;
+  z-index: var(--z-card-ctrl);
 }
 .menu-btn {
   width: 34px;
   height: 34px;
   border-radius: 8px;
+  /* 缩略图底色不可预测，用遮罩色保证 ⋯ 在任何照片上都可见 */
   background: var(--bg-overlay);
   color: #fff;
-  font-size: 1.1rem;
-  font-weight: 700;
-  line-height: 1;
   opacity: 0;
   transition: opacity 0.15s ease, background-color 0.15s ease;
   display: flex;
@@ -295,9 +326,11 @@ onBeforeUnmount(() => document.removeEventListener('click', onDocClick))
   box-shadow: var(--shadow-sm);
 }
 .menu {
-  position: absolute;
-  top: 38px;
-  right: 0;
+  /* 浮层 Teleport 到 body，坐标由 useCardMenu 量锚点算出、走行内样式。
+     这里只负责视觉样式，位置交给 top/left: 0 之外的 var(--z-popover) 层级。 */
+  position: fixed;
+  top: 0;
+  left: 0;
   min-width: 150px;
   background: var(--bg-elevated);
   border: 1px solid var(--border);
@@ -306,23 +339,46 @@ onBeforeUnmount(() => document.removeEventListener('click', onDocClick))
   padding: 6px;
   display: flex;
   flex-direction: column;
-  z-index: 50;
+  z-index: var(--z-popover);
 }
 .menu button {
   text-align: left;
-  padding: 1px 1px;
+  padding: 6px 10px;
   border-radius: 6px;
   font-size: 0.86rem;
   color: var(--text-heading);
   display: flex;
   align-items: center;
   gap: 8px;
-  min-height: 30px;
+  min-height: 34px;
 }
 .menu button:hover {
   background: var(--bg-hover);
 }
 .menu button.danger {
   color: var(--danger);
+}
+
+/* 触屏设备没有 hover 态。原先选择框与 ⋯ 菜单都靠 :hover 才显形，而 .visible
+   又依赖 selectable、selectable 依赖「已有选中项」——形成循环依赖，
+   结果是手机上既无法开始多选，也打不开单个文件的操作菜单，整条批量操作链路失效。
+   触屏下改为常显。 */
+@media (hover: none) {
+  .checkbox,
+  .menu-btn {
+    opacity: 1;
+  }
+  /* 视觉尺寸保持小巧以免遮住缩略图，但用伪元素把可点区域扩到 44×44
+     （WCAG 2.2 的 Web 下限是 24×24，44 是本项目其它控件的既有标准）。 */
+  .checkbox::after {
+    content: '';
+    position: absolute;
+    inset: -9px;
+  }
+  .menu-btn::after {
+    content: '';
+    position: absolute;
+    inset: -5px;
+  }
 }
 </style>

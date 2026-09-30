@@ -164,6 +164,14 @@ pub async fn batch_unshare(
     if total == 0 {
         return Err(AppError::BadRequest("请至少选择一个文件".into()));
     }
+    // 数量上限与 batch_share 对齐。此前只有 batch_share 有限制，
+    // batch_unshare 可传任意长度数组逐条串行查库——公网上这是个放大器。
+    if total > batch_service::MAX_BATCH_SIZE {
+        return Err(AppError::BadRequest(format!(
+            "单次最多操作 {} 个文件",
+            batch_service::MAX_BATCH_SIZE
+        )));
+    }
 
     let mut results = Vec::new();
     let mut unshared = 0;
@@ -193,11 +201,20 @@ pub async fn batch_unshare(
                 });
             }
             None => {
-                // 获取文件名用于结果输出
+                // 取文件名用于结果输出。
+                //
+                // 这里必须带 owner_id：原实现是 `WHERE id = ?`，而 files.id 是
+                // 稠密自增整数、公开接口又是已登录用户的 POST，
+                // 于是「取消分享一个自己没有的分享」会回显**任意用户的文件名**。
+                // 交付场景里文件名常含客户名与拍摄活动，这不是小泄漏。
+                //
+                // 查不到就返回占位符：既不区分「文件不存在」与「不属于你」，
+                // 也不泄露任何一方的信息。
                 let file_name: String = sqlx::query_scalar(
-                    "SELECT original_name FROM files WHERE id = ?",
+                    "SELECT original_name FROM files WHERE id = ? AND owner_id = ? AND deleted_at IS NULL",
                 )
                 .bind(file_id)
+                .bind(auth.user_id)
                 .fetch_optional(&pool)
                 .await?
                 .unwrap_or_else(|| "(未知)".to_string());

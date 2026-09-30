@@ -9,7 +9,10 @@ import {
 import { useToast } from '../composables/useToast'
 import { confirm } from '../composables/useConfirm'
 import { useTransfer } from '../composables/useTransfer'
+import { useProgressiveList } from '../composables/useProgressiveList'
 import FileCard from '../components/FileCard.vue'
+import AppIcon from '../components/AppIcon.vue'
+import LoadMore from '../components/LoadMore.vue'
 import FilePreview from '../components/FilePreview.vue'
 import ShareDialog from '../components/ShareDialog.vue'
 
@@ -28,9 +31,42 @@ const filters = reactive({
   order: 'desc',
 })
 
-const fileTypes = ref([])
-const files = ref([])
-const folders = ref([])
+/** 当前搜索条件（不含分页）。
+    loadMore 必须用与首页**完全相同**的条件：游标里带着排序标识，
+    服务端会校验它与本次请求的排序是否一致，不一致直接 400。 */
+function buildSearchParams() {
+  const params = { q: q.value.trim() }
+  if (filters.type) params.type = filters.type
+  if (filters.minSize !== '') {
+    params.min_size = Math.round(Number(filters.minSize) * 1024 * 1024)
+  }
+  if (filters.maxSize !== '') {
+    params.max_size = Math.round(Number(filters.maxSize) * 1024 * 1024)
+  }
+  if (filters.dateFrom) params.date_from = filters.dateFrom
+  if (filters.dateTo) params.date_to = filters.dateTo
+  params.sort = filters.sort
+  params.order = filters.order
+  return params
+}
+
+/* 服务端游标分页状态机。
+   FilePreview 拿到的是**已加载**的 files，所以预览里的左右翻页范围是
+   「本次已取回的这些」，而不是整个结果集 —— 点「加载更多」可以扩大它。 */
+const {
+  items: files,
+  folders,
+  fileTypes,
+  total: fileTotal,
+  hasMore: hasMoreFiles,
+  loadingMore,
+  error: pageError,
+  loadFirst: loadFirstPage,
+  loadMore: loadMoreFiles,
+  reset: resetPaging,
+} = useProgressiveList(({ limit, cursor }) =>
+  searchFiles({ ...buildSearchParams(), limit, cursor })
+)
 const loading = ref(false)
 const error = ref('')
 const hasSearched = ref(false)
@@ -48,32 +84,18 @@ function scheduleSearch() {
 async function runSearch() {
   const term = q.value.trim()
   if (!term) {
-    files.value = []
-    folders.value = []
+    // reset() 会同时作废在途请求，所以「清空关键词后又回来」不会把旧结果填回
+    resetPaging()
     hasSearched.value = false
     return
   }
   loading.value = true
-  error.value = ''
-  const params = { q: term }
-  if (filters.type) params.type = filters.type
-  if (filters.minSize !== '') params.min_size = Math.round(Number(filters.minSize) * 1024 * 1024)
-  if (filters.maxSize !== '') params.max_size = Math.round(Number(filters.maxSize) * 1024 * 1024)
-  if (filters.dateFrom) params.date_from = filters.dateFrom
-  if (filters.dateTo) params.date_to = filters.dateTo
-  params.sort = filters.sort
-  params.order = filters.order
-  try {
-    const data = await searchFiles(params)
-    files.value = data.files || []
-    folders.value = data.folders || []
-    fileTypes.value = data.file_types || []
-    hasSearched.value = true
-  } catch (e) {
-    error.value = e.message || '搜索失败'
-  } finally {
-    loading.value = false
-  }
+  // 新的一次搜索 = 新的一次查询：loadFirstPage 内部会递增序号，
+  // 在途的旧请求（含翻页请求）回来时会被丢弃
+  await loadFirstPage()
+  error.value = pageError.value
+  hasSearched.value = true
+  loading.value = false
 }
 
 watch(q, scheduleSearch)
@@ -152,8 +174,10 @@ function resetFilters() {
 
 <template>
   <div class="search">
+    <h1 class="sr-only">搜索</h1>
+
     <div class="searchbar card">
-      <span class="icon">🔍</span>
+      <AppIcon class="icon" name="Search" size="sm" />
       <input
         v-model="q"
         class="grow"
@@ -162,7 +186,7 @@ function resetFilters() {
         autofocus
       />
       <button v-if="q" class="btn-icon btn-ghost" aria-label="清除" @click="q = ''">
-        ✕
+        <AppIcon name="X" size="sm" />
       </button>
     </div>
 
@@ -229,19 +253,19 @@ function resetFilters() {
     </div>
 
     <div v-else-if="error" class="state">
-      <span class="emoji">⚠️</span>
+      <AppIcon class="state-icon" name="CircleAlert" size="xl" />
       <h3>搜索失败</h3>
       <p>{{ error }}</p>
     </div>
 
     <div v-else-if="!q.trim() && !hasSearched" class="state">
-      <span class="emoji">🔎</span>
+      <AppIcon class="state-icon" name="Search" size="xl" />
       <h3>输入关键词开始搜索</h3>
       <p>支持按类型、大小、日期组合筛选</p>
     </div>
 
     <div v-else-if="!files.length && !folders.length" class="state">
-      <span class="emoji">🗂️</span>
+      <AppIcon class="state-icon" name="SearchX" size="xl" />
       <h3>未找到匹配结果</h3>
       <p>试试调整关键词或筛选条件</p>
     </div>
@@ -260,7 +284,7 @@ function resetFilters() {
         </div>
       </div>
       <div v-if="files.length" class="section">
-        <h2 class="sec-title">文件 ({{ files.length }})</h2>
+        <h2 class="sec-title">文件 ({{ fileTotal }})</h2>
         <div class="grid">
           <FileCard
             v-for="f in files"
@@ -275,6 +299,14 @@ function resetFilters() {
           />
         </div>
       </div>
+
+      <LoadMore
+        :has-more="hasMoreFiles"
+        :loaded="files.length"
+        :total="fileTotal"
+        :loading="loadingMore"
+        @more="loadMoreFiles"
+      />
     </template>
 
     <FilePreview
@@ -302,7 +334,7 @@ function resetFilters() {
   padding: 10px 14px;
 }
 .searchbar .icon {
-  font-size: 1.1rem;
+  color: var(--text-muted);
 }
 .searchbar input {
   border: none;

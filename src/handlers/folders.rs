@@ -31,9 +31,13 @@ pub async fn list_folders(
 ) -> Result<Json<Value>, AppError> {
     let folders = folder_service::list_folders(&pool, auth.user_id, query.parent_id).await?;
 
-    // 如果指定了父文件夹 ID，则获取面包屑导航
+    // 如果指定了父文件夹 ID，则获取面包屑导航。
+    // 必须传 auth.user_id：面包屑沿 parent_id 向上每一跳都要校验归属，
+    // 漏传会让任意登录用户读到他人文件夹树。
     let breadcrumbs = if let Some(pid) = query.parent_id {
-        folder_service::get_breadcrumbs(&pool, pid).await.unwrap_or_default()
+        folder_service::get_breadcrumbs(&pool, auth.user_id, pid)
+            .await
+            .unwrap_or_default()
     } else {
         Vec::new()
     };

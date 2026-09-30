@@ -32,13 +32,19 @@ const els = {
   lbPrev: $('lb-prev'),
   lbNext: $('lb-next'),
   toast: $('toast'),
+  fileCount: $('file-count'),
+  loadMore: $('load-more'),
+  selAll: $('sel-all'),
 }
 
 let state = {
   user: null,
   crumbs: [],       // [{ id, name }] ; empty = root
   folders: [],
-  files: [],
+  files: [],        // 已加载的文件（跨页累积）
+  fileTotal: 0,     // 服务端报告的该目录文件总数（不是已加载数）
+  fileCursor: null, // 下一页的游标；null 表示已到末尾
+  fileHasMore: false,
   selected: new Set(),
   lbIndex: 0,
   toastTimer: null,
@@ -143,9 +149,13 @@ async function listFolders(parentId) {
   const params = parentId != null ? 'parent_id=' + parentId : ''
   return api('/api/folders' + (params ? '?' + params : ''))
 }
-async function listFiles(folderId) {
-  const params = folderId != null ? 'folder_id=' + folderId : ''
-  return api('/api/files' + (params ? '?' + params : ''))
+/* 游标分页。返回值是 { files, total, has_more, next_cursor, limit }，
+   不再是文件数组 —— 后端 2026-09-26 起对 /api/files 做了分页。 */
+async function listFiles(folderId, cursor) {
+  const parts = []
+  if (folderId != null) parts.push('folder_id=' + folderId)
+  if (cursor) parts.push('cursor=' + encodeURIComponent(cursor))
+  return api('/api/files' + (parts.length ? '?' + parts.join('&') : ''))
 }
 
 /* ----------------------------- views ----------------------------- */
@@ -204,6 +214,23 @@ function renderGrids() {
   els.fileSection.classList.toggle('hidden', state.files.length === 0)
   state.files.forEach((f, i) => els.files.appendChild(fileCard(f, i)))
   els.empty.classList.toggle('hidden', state.folders.length + state.files.length !== 0)
+
+  // 已加载 / 共多少
+  els.fileCount.textContent = state.files.length
+    ? '（已显示 ' + state.files.length + ' / 共 ' + state.fileTotal + '）'
+    : ''
+  // 加载更多按钮
+  els.loadMore.classList.toggle('hidden', !state.fileHasMore)
+  els.loadMore.textContent = '加载更多'
+  els.loadMore.disabled = false
+  // 全选只能覆盖已加载的项，把差额说清楚
+  if (els.selAll) {
+    const rest = Math.max(0, state.fileTotal - state.files.length)
+    els.selAll.parentElement.title = state.fileHasMore
+      ? '全选已显示的 ' + state.files.length + ' 项（还有 ' + rest + ' 项未加载，先点「加载更多」）'
+      : '全选当前文件夹下的所有文件'
+  }
+
   updateBatchUI()
 }
 
@@ -291,13 +318,50 @@ async function loadCurrent() {
     const id = currentFolderId()
     const [foldersRes, filesRes] = await Promise.all([listFolders(id), listFiles(id)])
     state.folders = (foldersRes && foldersRes.folders) || []
-    state.files = filesRes || []
+    applyFilePage(filesRes, false)
     renderGrids()
   } catch (err) {
     els.errorMsg.textContent = err.message
     els.error.classList.remove('hidden')
   } finally {
     els.loading.classList.add('hidden')
+  }
+}
+
+/* 把一页结果写进 state。append=false 表示这是第一页（整体替换）。
+   游标分页在理论上不会重复，但真重复时灯箱的 index 与勾选都会错位，
+   所以仍做一次按 id 去重。 */
+function applyFilePage(page, append) {
+  const rows = (page && page.files) || []
+  if (append) {
+    const seen = new Set(state.files.map(function (f) { return f.id }))
+    state.files = state.files.concat(
+      rows.filter(function (f) { return !seen.has(f.id) })
+    )
+  } else {
+    state.files = rows
+  }
+  state.fileTotal = (page && page.total) || 0
+  state.fileHasMore = !!(page && page.has_more)
+  state.fileCursor = (page && page.next_cursor) || null
+}
+
+/* 追加下一页。失败时只提示，不动已有列表。 */
+async function loadMoreFiles() {
+  if (!state.fileCursor) return
+  els.loadMore.disabled = true
+  els.loadMore.textContent = '加载中…'
+  const cursorAtRequest = state.fileCursor
+  try {
+    const page = await listFiles(currentFolderId(), cursorAtRequest)
+    // 期间若切了目录，这一页属于旧目录，丢弃
+    if (state.fileCursor !== cursorAtRequest) return
+    applyFilePage(page, true)
+    renderGrids()
+  } catch (err) {
+    els.loadMore.disabled = false
+    els.loadMore.textContent = '加载更多'
+    toast(err.message)
   }
 }
 
@@ -421,6 +485,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'ArrowRight') { state.lbIndex++; refreshLightbox() }
 })
 els.retryBtn.addEventListener('click', loadCurrent)
+els.loadMore.addEventListener('click', loadMoreFiles)
 document.getElementById('sel-all').addEventListener('change', function (e) {
   if (e.target.checked) state.files.forEach(function (f) { state.selected.add(f.id) })
   else state.selected.clear()

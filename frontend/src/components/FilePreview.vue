@@ -2,6 +2,8 @@
 import { computed, watch, ref, onMounted, onBeforeUnmount } from 'vue'
 import { authUrl, fileIcon, formatSize, formatDate, isImageFile } from '../api'
 import { useTransfer } from '../composables/useTransfer'
+import AppIcon from './AppIcon.vue'
+import { useModal } from '../composables/useModal'
 
 const transfer = useTransfer()
 
@@ -32,9 +34,23 @@ const isAudio = computed(() => {
 })
 const isPdf = computed(() => current.value?.file_type?.toLowerCase() === 'pdf')
 
+/* GIF 走原文件，<img> 天然就会播动图；其它类型维持现状（预览图优先）。
+   列表页的 hover 动图见 FileCard.vue —— 这里管的是「点开大图」。 */
+const isGif = computed(() => {
+  const name = current.value?.name || ''
+  return name.split('.').pop()?.toLowerCase() === 'gif'
+})
+
+/* 超大 GIF 播起来是持续解码，占内存且耗 CPU，可能让浏览器卡住。
+   表情包通常几十 KB，这个阈值只有少数超大 GIF 会被挡在门外。 */
+const GIF_MAX_BYTES = 8 * 1024 * 1024
+
 const mediaSrc = computed(() => {
   if (!current.value) return ''
-  const url = current.value.preview_url || current.value.media_url
+  const url =
+    isGif.value && (current.value.size || 0) <= GIF_MAX_BYTES
+      ? current.value.media_url
+      : current.value.preview_url || current.value.media_url
   return authUrl(url)
 })
 
@@ -70,14 +86,18 @@ function onImgError() {
   imgError.value = true
   imgLoaded.value = true
 }
+// 只处理左右方向键；Esc 交给 useModal，避免同一次按键 emit 两次 close
 function onKey(e) {
   if (!props.visible) return
-  if (e.key === 'Escape') emit('close')
-  else if (e.key === 'ArrowLeft') prev()
+  if (e.key === 'ArrowLeft') prev()
   else if (e.key === 'ArrowRight') next()
 }
 onMounted(() => window.addEventListener('keydown', onKey))
 onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
+
+const previewEl = ref(null)
+// 全屏预览同样是模态：焦点要锁在预览内，Esc 关闭，关闭后归还焦点
+useModal(() => props.visible, { container: previewEl, onClose: () => emit('close') })
 
 watch(
   () => props.visible,
@@ -95,9 +115,16 @@ watch(
 <template>
   <Teleport to="body">
     <Transition name="fade">
-      <div v-if="visible && current" class="preview" role="dialog" aria-modal="true">
+      <div
+        v-if="visible && current"
+        ref="previewEl"
+        class="preview"
+        role="dialog"
+        aria-modal="true"
+        tabindex="-1"
+      >
         <header class="bar">
-          <div class="title truncate">
+          <div class="title truncate" :title="current.name">
             {{ current.name }}
           </div>
           <div class="bar-actions">
@@ -107,10 +134,10 @@ watch(
               href="#"
               @click.prevent="downloadCurrent"
             >
-              ⬇️ 下载
+              <AppIcon name="Download" size="sm" /> 下载
             </a>
             <button class="btn-icon btn-ghost" aria-label="关闭" @click="$emit('close')">
-              ✕
+              <AppIcon name="X" size="sm" />
             </button>
           </div>
         </header>
@@ -121,7 +148,7 @@ watch(
           aria-label="上一个"
           @click="prev"
         >
-          ‹
+          <AppIcon name="ChevronLeft" size="lg" />
         </button>
         <button
           v-if="hasNext"
@@ -129,7 +156,7 @@ watch(
           aria-label="下一个"
           @click="next"
         >
-          ›
+          <AppIcon name="ChevronRight" size="lg" />
         </button>
 
         <div class="stage" @click.self="$emit('close')">
@@ -144,14 +171,18 @@ watch(
               />
               <span v-show="!imgLoaded && !imgError" class="spinner" />
               <div v-if="imgError" class="fallback">
-                <span class="emoji">{{ fileIcon(current.file_type, current.name) }}</span>
+                <AppIcon
+                  class="fallback-icon"
+                  :name="fileIcon(current.file_type, current.name)"
+                  size="xl"
+                />
                 <p>预览加载失败</p>
                 <a
                   class="btn btn-primary btn-sm"
                   href="#"
                   @click.prevent="downloadCurrent"
                 >
-                  ⬇️ 下载文件
+                  <AppIcon name="Download" size="sm" /> 下载文件
                 </a>
               </div>
             </template>
@@ -164,14 +195,18 @@ watch(
                 @error="mediaError = true"
               />
               <div v-else class="fallback">
-                <span class="emoji">{{ fileIcon(current.file_type, current.name) }}</span>
+                <AppIcon
+                  class="fallback-icon"
+                  :name="fileIcon(current.file_type, current.name)"
+                  size="xl"
+                />
                 <p>视频预览加载失败</p>
                 <a
                   class="btn btn-primary btn-sm"
                   href="#"
                   @click.prevent="downloadCurrent"
                 >
-                  ⬇️ 下载文件
+                  <AppIcon name="Download" size="sm" /> 下载文件
                 </a>
               </div>
             </template>
@@ -184,14 +219,18 @@ watch(
                 @error="mediaError = true"
               />
               <div v-else class="fallback">
-                <span class="emoji">{{ fileIcon(current.file_type, current.name) }}</span>
+                <AppIcon
+                  class="fallback-icon"
+                  :name="fileIcon(current.file_type, current.name)"
+                  size="xl"
+                />
                 <p>音频预览加载失败</p>
                 <a
                   class="btn btn-primary btn-sm"
                   href="#"
                   @click.prevent="downloadCurrent"
                 >
-                  ⬇️ 下载文件
+                  <AppIcon name="Download" size="sm" /> 下载文件
                 </a>
               </div>
             </template>
@@ -203,14 +242,16 @@ watch(
               sandbox="allow-same-origin allow-downloads"
             />
             <div v-else class="fallback">
-              <span class="emoji">{{ fileIcon(current.file_type, current.name) }}</span>
+              <AppIcon
+                class="fallback-icon"
+                :name="fileIcon(current.file_type, current.name)"
+                size="xl"
+              />
               <p>该文件类型暂不支持在线预览</p>
-              <a
-                class="btn btn-primary btn-sm"
-                :href="downloadHref"
-                :download="current.name"
-              >
-                ⬇️ 下载文件
+              <!-- 原为 :href="downloadHref"，但 downloadHref 全项目未定义，
+                   这个回退下载按钮实际是坏的。改为与其它三处一致走下载队列。 -->
+              <a class="btn btn-primary btn-sm" href="#" @click.prevent="downloadCurrent">
+                <AppIcon name="Download" size="sm" /> 下载文件
               </a>
             </div>
           </div>
@@ -221,7 +262,7 @@ watch(
           <span class="dot">·</span>
           <span>{{ formatDate(current.uploaded_at) }}</span>
           <span class="dot">·</span>
-          <span class="truncate">{{ current.name }}</span>
+          <span class="truncate" :title="current.name">{{ current.name }}</span>
         </footer>
       </div>
     </Transition>
@@ -233,7 +274,7 @@ watch(
   position: fixed;
   inset: 0;
   background: rgba(8, 10, 18, 0.92);
-  z-index: 8000;
+  z-index: var(--z-preview);
   display: flex;
   flex-direction: column;
 }
@@ -289,7 +330,8 @@ watch(
   max-height: 80vh;
   object-fit: contain;
   border-radius: 4px;
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  /* 原为硬编码 0 10px 40px，绕过了 --shadow-* 三档令牌 */
+  box-shadow: var(--shadow-lg);
 }
 .viewer video {
   max-width: 100%;
@@ -309,8 +351,9 @@ watch(
   gap: 14px;
   color: #cfd3e0;
 }
-.fallback .emoji {
-  font-size: 4rem;
+/* 颜色继承 .fallback 的 #cfd3e0，不需要单独指定 */
+.fallback .fallback-icon {
+  opacity: 0.9;
 }
 
 .nav {
@@ -322,8 +365,6 @@ watch(
   border-radius: 50%;
   background: rgba(255, 255, 255, 0.12);
   color: #fff;
-  font-size: 2rem;
-  line-height: 1;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -362,7 +403,6 @@ watch(
   .nav {
     width: 44px;
     height: 44px;
-    font-size: 1.6rem;
   }
   .nav.prev {
     left: 8px;

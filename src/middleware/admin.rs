@@ -66,38 +66,23 @@ where
             }
         };
 
-        // 检查用户角色
-        let role: Option<(String,)> = sqlx::query_as(
-            "SELECT role FROM users WHERE id = ?",
-        )
-        .bind(claims.sub)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
+        // 角色 + 有效期一并校验。有效性判定在 account_guard 里，
+        // 与 AuthUser 提取器共用——此前这里只查 role，已过期管理员仍能管理全部用户。
+        if let Err(e) = crate::services::account_guard::require_active_admin(&pool, claims.sub).await {
+            return Err((
+                e.status_code(),
                 Json(json!({
                     "success": false,
                     "data": null,
-                    "error": "服务器内部错误"
+                    "error": e.message()
                 })),
-            )
-        })?;
-
-        match role {
-            Some((r,)) if r == "admin" => Ok(AdminUser {
-                user_id: claims.sub,
-                username: claims.username,
-            }),
-            _ => Err((
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "success": false,
-                    "data": null,
-                    "error": "需要管理员权限"
-                })),
-            )),
+            ));
         }
+
+        Ok(AdminUser {
+            user_id: claims.sub,
+            username: claims.username,
+        })
     }
 }
 
