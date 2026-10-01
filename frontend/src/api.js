@@ -12,17 +12,95 @@ import router from './router'
 
 const TOKEN_KEY = 'token'
 
+/* ===========================================================================
+   Media ticket
+   ---------------------------------------------------------------------------
+   Thumbnails, previews and download links are loaded by <img> / <a download>,
+   which cannot send an Authorization header. Those URLs therefore have to
+   carry a credential in the query string.
+
+   They used to carry the **JWT itself** — a 7-day, full-permission bearer
+   token — into every thumbnail URL. Query strings are recorded verbatim by
+   Cloudflare's edge logs, the browser history and DevTools, so one thumbnail
+   load copied the account key into three logs.
+
+   The backend now issues a narrow, short-lived `media_ticket` (2h, media and
+   download endpoints only). It answers "who are you"; file ownership is still
+   enforced by `owner_id` in SQL on the server side, so this widens nothing.
+
+   The ticket is returned by /auth/login, /auth/register and /auth/me, and can
+   be refreshed on demand via /auth/media-ticket. The request interceptor
+   below refreshes it *before* any other API call goes out, which guarantees a
+   fresh ticket is in hand by the time a list response produces thumbnail
+   URLs — no flash of broken images after the ticket expires.
+   =========================================================================== */
+
+const MEDIA_TICKET_TTL_MS = 2 * 60 * 60 * 1000
+/** Refresh this long before the real expiry, so a request never races it. */
+const MEDIA_TICKET_SKEW_MS = 60 * 1000
+
+let mediaTicket = null
+let mediaTicketExpiresAt = 0
+let mediaTicketPending = null
+
+export function setMediaTicket(ticket, ttlSeconds) {
+  if (!ticket) {
+    clearMediaTicket()
+    return
+  }
+  mediaTicket = ticket
+  const ttl = ttlSeconds ? Number(ttlSeconds) * 1000 : MEDIA_TICKET_TTL_MS
+  mediaTicketExpiresAt = Date.now() + Math.max(0, ttl - MEDIA_TICKET_SKEW_MS)
+}
+
+export function clearMediaTicket() {
+  mediaTicket = null
+  mediaTicketExpiresAt = 0
+  mediaTicketPending = null
+}
+
+const mediaTicketFresh = () => !!mediaTicket && Date.now() < mediaTicketExpiresAt
+
+/**
+ * Ensure a usable media ticket exists, fetching one if needed.
+ * Concurrent callers share a single in-flight request.
+ */
+function ensureMediaTicket() {
+  if (mediaTicketFresh()) return Promise.resolve(mediaTicket)
+  if (!localStorage.getItem(TOKEN_KEY)) return Promise.resolve(null)
+  if (!mediaTicketPending) {
+    mediaTicketPending = instance
+      .post('/api/auth/media-ticket')
+      .then((data) => {
+        setMediaTicket(data?.ticket, data?.expires_in)
+        return mediaTicket
+      })
+      .catch(() => null)
+      .finally(() => {
+        mediaTicketPending = null
+      })
+  }
+  return mediaTicketPending
+}
+
 const instance = axios.create({
   baseURL: '',
   timeout: 120000,
 })
 
 // Attach JWT to every request when available.
-instance.interceptors.request.use((config) => {
+instance.interceptors.request.use(async (config) => {
   const token = localStorage.getItem(TOKEN_KEY)
   if (token) {
     config.headers = config.headers || {}
     config.headers.Authorization = `Bearer ${token}`
+  }
+  // Every authenticated API call is a chance to refresh the media ticket.
+  // Doing it here (rather than lazily at render time) is what keeps
+  // `authUrl()` synchronous and free of broken-image races.
+  const url = config.url || ''
+  if (token && url.startsWith('/api/') && !url.startsWith('/api/auth/')) {
+    await ensureMediaTicket()
   }
   return config
 })
@@ -32,7 +110,13 @@ instance.interceptors.response.use(
   (response) => {
     const body = response.data
     if (body && typeof body === 'object' && 'success' in body) {
-      if (body.success) return body.data
+      if (body.success) {
+        // Login / register / me all hand back a fresh ticket.
+        if (body.data && body.data.media_ticket) {
+          setMediaTicket(body.data.media_ticket, body.data.media_ticket_ttl)
+        }
+        return body.data
+      }
       return Promise.reject(new Error(body.error || '请求失败'))
     }
     return body
@@ -48,6 +132,7 @@ instance.interceptors.response.use(
       if (status === 401) {
         localStorage.removeItem(TOKEN_KEY)
         localStorage.removeItem('user')
+        clearMediaTicket()
         const current = router.currentRoute
           ? router.currentRoute.value
           : null
@@ -79,16 +164,17 @@ export default instance
    =========================================================================== */
 
 /**
- * Append the current JWT as a query param. Required for resources loaded by
- * <img>/<a download> which cannot send an Authorization header
- * (backend supports ?token= for download/media endpoints).
+ * Append the current media ticket as a query param. Required for resources
+ * loaded by <img>/<a download> which cannot send an Authorization header
+ * (backend accepts ?ticket= on the download/media endpoints).
+ *
+ * Uses the short-lived media ticket, never the JWT.
  */
 export function authUrl(url) {
   if (!url) return url
-  const token = localStorage.getItem(TOKEN_KEY)
-  if (!token) return url
+  if (!mediaTicket) return url
   const sep = url.includes('?') ? '&' : '?'
-  return `${url}${sep}token=${encodeURIComponent(token)}`
+  return `${url}${sep}ticket=${encodeURIComponent(mediaTicket)}`
 }
 
 /* ===========================================================================
@@ -216,23 +302,61 @@ export const deleteShare = (id) => instance.delete(`/api/shares/${id}`)
    Public share API (no auth)
    =========================================================================== */
 
-export const getPublicShare = (id) => instance.get(`/api/public/shares/${id}`)
+/**
+ * Public share detail.
+ *
+ * For password-protected shares the backend only returns preview/thumb URLs
+ * when the request carries a valid access ticket, so `ticket` must be passed
+ * once the visitor has verified the password (PublicShare.vue re-loads after
+ * verifying). Without it the response is still valid — just without media URLs.
+ */
+export const getPublicShare = (id, ticket) =>
+  instance.get(`/api/public/shares/${id}`, {
+    params: ticket ? { ticket } : {},
+  })
 
 export const verifySharePassword = (id, password) =>
   instance.post(`/api/public/shares/${id}/verify`, { password })
 
-export const publicShareDownloadUrl = (id, ticket) => {
-  let url = `/api/public/shares/${id}/download`
-  if (ticket) url += `?ticket=${encodeURIComponent(ticket)}`
-  return url
+/**
+ * 浏览批次内容。
+ *
+ * 不传 folderId → 列出批次顶层（里面直接包含的文件与文件夹）。
+ * 传 folderId → 列出该文件夹的直接子级（后端会先校验它落在批次范围内）。
+ *
+ * 批次模型下一个分享指向的是一批条目，不再是单个文件，所以「这个分享里有
+ * 什么」必须单独问一次这个接口。
+ */
+export const getPublicShareItems = (id, { folderId = null, cursor = null, limit = null, ticket = null } = {}) => {
+  const params = {}
+  if (folderId != null) params.folder_id = folderId
+  if (cursor) params.cursor = cursor
+  if (limit) params.limit = limit
+  if (ticket) params.ticket = ticket
+  return instance
+    .get(`/api/public/shares/${id}/items`, { params })
+    .then((d) => ({
+      folderId: d.folder_id ?? null,
+      breadcrumbs: d.breadcrumbs || [],
+      items: d.items || [],
+      total: d.total ?? 0,
+      hasMore: !!d.has_more,
+      nextCursor: d.next_cursor || null,
+    }))
 }
 
-export const publicShareMediaUrl = (id, { thumb = false, preview = false } = {}) => {
-  const params = new URLSearchParams()
-  if (thumb) params.set('thumb', '1')
-  if (preview) params.set('preview', '1')
-  const q = params.toString()
-  return `/api/public/shares/${id}/media${q ? `?${q}` : ''}`
+/**
+ * 给后端下发的公开资源地址补上访问凭证。
+ *
+ * 批次里的每个条目，后端都已经生成了带 `file_id` 的完整地址
+ * （`preview_url` / `thumb_url` / `download_url`），前端只负责追加 ticket——
+ * 地址拼装规则只有一处（后端 side），这里不重复实现一遍，
+ * 免得两边对「哪个参数叫什么」产生分歧。
+ */
+export const withShareTicket = (url, ticket) => {
+  if (!url || !ticket) return url
+  const sep = url.includes('?') ? '&' : '?'
+  return `${url}${sep}ticket=${encodeURIComponent(ticket)}`
 }
 
 /* ===========================================================================
@@ -256,7 +380,8 @@ export const batchCopy = (payload) => instance.post('/api/batch/copy', payload)
 export const batchDelete = (payload) =>
   instance.post('/api/batch/delete', payload)
 
-export const batchShare = (payload) => instance.post('/api/batch/share', payload)
+/* 没有 batchShare：批次模型下「分享选中的这批东西」就是 createShare，
+   后端已删掉 /api/batch/share（两个端点会完全同义）。 */
 
 export const batchUnshare = (payload) =>
   instance.post('/api/batch/unshare', payload)

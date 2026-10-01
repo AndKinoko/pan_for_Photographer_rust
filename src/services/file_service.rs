@@ -40,6 +40,45 @@ const RAW_FORMATS: &[&str] = &[
     "nef", "cr2", "cr3", "crw", "arw", "sr2", "srf", "dng", "raf", "orf", "rw2", "nrw",
 ];
 
+/// 所有可生成预览的扩展名（图片 + RAW），供 SQL 侧过滤。
+///
+/// 存在的理由：`sweeper::retry_missing_previews` 需要把「不支持预览的类型」
+/// 在 SQL 里就排除掉，否则每 10 分钟都要把库里所有视频/压缩包捞出来再在
+/// Rust 里逐条跳过。列表由这里统一给出，避免两处各自维护而漂移。
+pub fn previewable_types() -> Vec<String> {
+    IMAGE_FORMATS
+        .iter()
+        .chain(RAW_FORMATS.iter())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// 某个用户实际占用的磁盘字节数。
+///
+/// **口径是「物理文件去重」而不是「记录求和」。** 批量复制（`batch_service::batch_copy`）
+/// 插入的新记录复用同一个 `stored_path` —— 磁盘上只有一份字节，但记录有两行。
+/// 若直接 `SUM(size)`，复制一次用量就翻一倍，用户明明没占盘却被配额拦在上传之外，
+/// 侧边栏那个容量进度条也随之失真。
+///
+/// 反过来，也不能简单地「不统计副本行」：那样只要「复制一份 → 删掉原件」，
+/// 就能让一份真实占用的磁盘变得不可见，反复操作即可撑爆磁盘。
+/// 按 `stored_path` 去重是唯一同时满足两边的口径：每份物理字节恰好计一次，
+/// 无论它被多少行引用。
+///
+/// 与上传时那条 `INSERT ... SELECT ... WHERE used + ? <= quota` 必须保持同一口径，
+/// 否则「显示可用但传不上去」或「显示满了却能传」会立刻出现。
+/// 索引 `idx_files_owner_stored` 就是为该聚合建的。
+pub async fn used_bytes(pool: &SqlitePool, owner_id: i64) -> Result<i64, AppError> {
+    let (total,): (i64,) = sqlx::query_as(
+        "SELECT COALESCE(SUM(size), 0) FROM
+             (SELECT DISTINCT stored_path, size FROM files WHERE owner_id = ?)",
+    )
+    .bind(owner_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(total)
+}
+
 /// 文件列表的排序标识。它同时是游标里携带的「排序名」——
 /// 服务端用它校验「上一页的游标」与「本次请求的排序」是否一致，
 /// 不一致就报错，而不是静默返回位置无意义的结果。
@@ -192,8 +231,12 @@ pub async fn soft_delete_file(
     file_id: i64,
     owner_id: i64,
 ) -> Result<(), AppError> {
+    // 单独删除的文件必须清掉 `deleted_with_folder_id`：
+    // 一个文件可能先前是被父文件夹连带删掉的，用户把它单独恢复了，
+    // 现在又单独删除——这一次它属于「单独删除」，恢复父文件夹时不该跟着复活。
     let result = sqlx::query(
-        "UPDATE files SET deleted_at = datetime('now') WHERE id = ? AND owner_id = ? AND deleted_at IS NULL",
+        "UPDATE files SET deleted_at = datetime('now'), deleted_with_folder_id = NULL
+         WHERE id = ? AND owner_id = ? AND deleted_at IS NULL",
     )
     .bind(file_id)
     .bind(owner_id)
@@ -237,7 +280,8 @@ pub async fn restore_file(
         if folder_exists.is_none() {
             // 父文件夹也被删除了，将文件移到根目录
             sqlx::query(
-                "UPDATE files SET folder_id = NULL, deleted_at = NULL WHERE id = ? AND owner_id = ?",
+                "UPDATE files SET folder_id = NULL, deleted_at = NULL, deleted_with_folder_id = NULL
+                 WHERE id = ? AND owner_id = ?",
             )
             .bind(file_id)
             .bind(owner_id)
@@ -245,7 +289,7 @@ pub async fn restore_file(
             .await?;
         } else {
             sqlx::query(
-                "UPDATE files SET deleted_at = NULL WHERE id = ? AND owner_id = ?",
+                "UPDATE files SET deleted_at = NULL, deleted_with_folder_id = NULL WHERE id = ? AND owner_id = ?",
             )
             .bind(file_id)
             .bind(owner_id)
@@ -254,7 +298,7 @@ pub async fn restore_file(
         }
     } else {
         sqlx::query(
-            "UPDATE files SET deleted_at = NULL WHERE id = ? AND owner_id = ?",
+            "UPDATE files SET deleted_at = NULL, deleted_with_folder_id = NULL WHERE id = ? AND owner_id = ?",
         )
         .bind(file_id)
         .bind(owner_id)

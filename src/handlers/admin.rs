@@ -50,6 +50,39 @@ fn normalize_expires(v: Option<String>) -> Option<String> {
     Some(norm)
 }
 
+/// 当前管理员总数。用于「不能把管理员改成一个不剩」的判定。
+async fn count_admins(pool: &SqlitePool) -> Result<i64, AppError> {
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE role = 'admin'")
+        .fetch_one(pool)
+        .await?;
+    Ok(n)
+}
+
+/// 管理员不可降级。
+///
+/// 为什么不是「最后一个管理员不可降级」这种更宽松的规则：唯一的管理员把自己
+/// 设成普通用户之后，没有任何入口能改回来 —— 只能进容器手改数据库，而触发它
+/// 只需在管理界面点一下下拉框。这类不可逆的运维事故，值得用一条更粗的规则堵死：
+/// **任何**管理员的角色都不能从 admin 改成别的。误升级的人可以直接删除后重建，
+/// 那条路径是可逆的、且需要二次确认。
+///
+/// 配套的第二道闸是 [`count_admins`]：即使将来有人放宽上面这条规则，
+/// 「不能把管理员删到一个不剩」也必须独立成立。
+async fn ensure_admin_not_demoted(
+    pool: &SqlitePool,
+    old_role: &str,
+    new_role: &str,
+) -> Result<(), AppError> {
+    if old_role == "admin" && new_role != "admin" {
+        let total = count_admins(pool).await?;
+        return Err(AppError::BadRequest(format!(
+            "管理员不可降级（当前共有 {} 个管理员）。如需移除，请改为删除该账号。",
+            total
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,12 +124,9 @@ async fn build_admin_user(pool: &SqlitePool, user: User) -> Result<serde_json::V
     .fetch_one(pool)
     .await?;
 
-    // 用量含回收站（软删除文件仍占磁盘），与配额校验口径一致
-    let (used_bytes,): (i64,) =
-        sqlx::query_as("SELECT COALESCE(SUM(size), 0) FROM files WHERE owner_id = ?")
-            .bind(user.id)
-            .fetch_one(pool)
-            .await?;
+    // 用量含回收站（软删除文件仍占磁盘），与配额校验口径一致。
+    // 按 stored_path 去重的原因见 `file_service::used_bytes`。
+    let used_bytes = crate::services::file_service::used_bytes(pool, user.id).await?;
 
     let original_folder_id: Option<(i64,)> = sqlx::query_as(
         "SELECT id FROM folders WHERE owner_id = ? AND name = '原图' AND parent_id IS NULL AND deleted_at IS NULL",
@@ -125,23 +155,82 @@ async fn build_admin_user(pool: &SqlitePool, user: User) -> Result<serde_json::V
     }))
 }
 
+/// 用户列表的一行：用户字段 + 由数据库一次算好的统计字段。
+///
+/// 为什么不复用 `build_admin_user` 逐个拼：那是「每个用户 3 条 SQL」，
+/// 500 个用户就是 1501 次往返。这里把三份统计压成三条聚合子查询，
+/// 与用户表 LEFT JOIN 后一次取回 —— 往返数与用户数无关。
+#[derive(sqlx::FromRow)]
+struct AdminUserRow {
+    id: i64,
+    username: String,
+    role: String,
+    created_at: String,
+    expires_at: Option<String>,
+    quota_bytes: i64,
+    file_count: i64,
+    used_bytes: i64,
+    original_folder_id: Option<i64>,
+}
+
+impl AdminUserRow {
+    fn into_json(self) -> serde_json::Value {
+        let usage_percent = if self.quota_bytes > 0 {
+            ((self.used_bytes as f64 / self.quota_bytes as f64) * 1000.0).round() / 10.0
+        } else {
+            100.0
+        };
+        serde_json::json!({
+            "id": self.id,
+            "username": self.username,
+            "role": self.role,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "quota_bytes": self.quota_bytes,
+            "used_bytes": self.used_bytes,
+            "formatted_used": crate::models::file::format_file_size(self.used_bytes),
+            "usage_percent": usage_percent,
+            "file_count": self.file_count,
+            "original_folder_id": self.original_folder_id,
+        })
+    }
+}
+
 /// GET /api/admin/users 获取所有用户列表
 pub async fn list_users(
     State(pool): State<SqlitePool>,
     _admin: AdminUser,
 ) -> Result<Json<Value>, AppError> {
-    let users = sqlx::query_as::<_, User>("SELECT * FROM users ORDER BY created_at DESC")
-        .fetch_all(&pool)
-        .await?;
-
-    let mut list = Vec::new();
-    for u in users {
-        list.push(build_admin_user(&pool, u).await?);
-    }
+    let rows = sqlx::query_as::<_, AdminUserRow>(
+        r#"
+        SELECT u.id, u.username, u.role, u.created_at, u.expires_at, u.quota_bytes,
+               COALESCE(fc.cnt, 0)   AS file_count,
+               COALESCE(uc.bytes, 0) AS used_bytes,
+               (SELECT fo.id FROM folders fo
+                 WHERE fo.owner_id = u.id AND fo.name = '原图'
+                   AND fo.parent_id IS NULL AND fo.deleted_at IS NULL
+                 LIMIT 1)             AS original_folder_id
+        FROM users u
+        LEFT JOIN (
+            SELECT owner_id, COUNT(*) AS cnt FROM files
+            WHERE deleted_at IS NULL GROUP BY owner_id
+        ) fc ON fc.owner_id = u.id
+        LEFT JOIN (
+            -- 与 file_service::used_bytes 同一口径：按物理文件去重，
+            -- 否则批量复制出的副本会把用量按副本数翻倍。
+            SELECT owner_id, SUM(size) AS bytes FROM (
+                SELECT DISTINCT owner_id, stored_path, size FROM files
+            ) GROUP BY owner_id
+        ) uc ON uc.owner_id = u.id
+        ORDER BY u.created_at DESC
+        "#,
+    )
+    .fetch_all(&pool)
+    .await?;
 
     Ok(Json(json!({
         "success": true,
-        "data": list,
+        "data": rows.into_iter().map(AdminUserRow::into_json).collect::<Vec<_>>(),
         "error": null
     })))
 }
@@ -164,7 +253,7 @@ pub async fn create_user(
         return Err(AppError::BadRequest("无效的角色，必须是 'user' 或 'admin'".into()));
     }
 
-    let password_hash = crate::utils::crypto::hash_password(&req.password)?;
+    let password_hash = crate::utils::crypto::hash_password_async(&req.password).await?;
     let expires_at = normalize_expires(req.expires_at.flatten());
     let quota_bytes = match req.quota_bytes {
         Some(v) if v < 0 => return Err(AppError::BadRequest("配额不能为负数".into())),
@@ -234,13 +323,14 @@ pub async fn update_user(
         if p.len() < 6 {
             return Err(AppError::BadRequest("密码长度至少6位".into()));
         }
-        user.password_hash = crate::utils::crypto::hash_password(p)?;
+        user.password_hash = crate::utils::crypto::hash_password_async(p).await?;
     }
     if let Some(ref r) = req.role {
         let role = r.trim();
         if role != "user" && role != "admin" {
             return Err(AppError::BadRequest("无效的角色，必须是 'user' 或 'admin'".into()));
         }
+        ensure_admin_not_demoted(&pool, &user.role, role).await?;
         user.role = role.to_string();
     }
     // expires_at 提供时（Some(_)）更新；提供 null 表示清除有效期；未提供保持原样
@@ -292,15 +382,19 @@ pub async fn update_user_role(
         return Err(AppError::BadRequest("无效的角色，必须是 'user' 或 'admin'".into()));
     }
 
-    let result = sqlx::query("UPDATE users SET role = ? WHERE id = ?")
+    // 与 update_user 同一道闸：先读出当前角色再判定，不能只看请求里的新角色。
+    let current: Option<(String,)> = sqlx::query_as("SELECT role FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(&pool)
+        .await?;
+    let current = current.ok_or_else(|| AppError::NotFound("用户不存在".into()))?;
+    ensure_admin_not_demoted(&pool, &current.0, role).await?;
+
+    sqlx::query("UPDATE users SET role = ? WHERE id = ?")
         .bind(role)
         .bind(user_id)
         .execute(&pool)
         .await?;
-
-    if result.rows_affected() == 0 {
-        return Err(AppError::NotFound("用户不存在".into()));
-    }
 
     let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
         .bind(user_id)
@@ -323,6 +417,23 @@ pub async fn delete_user(
     // 防止删除自己
     if user_id == _admin.user_id {
         return Err(AppError::BadRequest("不能删除当前登录的管理员账户".into()));
+    }
+
+    // 第二道闸：无论如何都不能把管理员删到一个不剩。
+    //
+    // 上面「不能删自己」已经把最常见的那条路堵住了（删自己的人同时也是管理员，
+    // 于是至少还剩他自己），所以这条在今天的规则下打不到；但它是**独立的**——
+    // 将来若放宽自删限制、或新增批删接口，这里不必重新推导一遍。
+    let target_role: Option<(String,)> = sqlx::query_as("SELECT role FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(&pool)
+        .await?;
+    if let Some((role,)) = target_role {
+        if role == "admin" && count_admins(&pool).await? <= 1 {
+            return Err(AppError::BadRequest(
+                "这是最后一个管理员账户，删除后将无人能管理本系统".into(),
+            ));
+        }
     }
 
     let result = sqlx::query("DELETE FROM users WHERE id = ?")
@@ -362,9 +473,14 @@ pub async fn get_stats(
         .fetch_one(&pool)
         .await?;
 
-    let total_size: (i64,) = sqlx::query_as("SELECT COALESCE(SUM(size), 0) FROM files WHERE deleted_at IS NULL")
-        .fetch_one(&pool)
-        .await?;
+    // 与用户侧同一口径：按物理文件去重。批量复制会让同一份字节对应多行记录，
+    // 裸 SUM 会把总占用算成副本数倍。
+    let total_size: (i64,) = sqlx::query_as(
+        "SELECT COALESCE(SUM(size), 0) FROM
+             (SELECT DISTINCT owner_id, stored_path, size FROM files WHERE deleted_at IS NULL)",
+    )
+    .fetch_one(&pool)
+    .await?;
 
     let trash_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM files WHERE deleted_at IS NOT NULL")
         .fetch_one(&pool)
@@ -548,22 +664,23 @@ pub async fn delete_invite_code(
 // ===========================================================================
 
 /// POST /api/admin/gc/cleanup 立即执行一次孤儿清理
+///
+/// 互斥与最小间隔都在 `sweeper::cleanup_orphans_throttled` 里，用户侧的
+/// 「清空回收站后即时清理」走的是同一个入口 —— 两处各自实现一遍互斥标志
+/// 正是本条修复之前的状态，结果是用户侧那条完全没有保护。
 pub async fn run_gc_cleanup(
     State(pool): State<SqlitePool>,
     _admin: AdminUser,
     State(config): State<Config>,
 ) -> Result<Json<Value>, AppError> {
-    // 防止并发点击：两个清理同时跑会互相争抢同一批文件
-    // （虽然 ORPHAN_GRACE 宽限期能兜住大部分情况，但没必要冒这个险）
-    static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return Err(AppError::TooManyRequests("上一次清理还在进行中，请稍候".into()));
-    }
+    let stats = sweeper::cleanup_orphans_throttled(&pool, &config)
+        .await
+        .ok_or_else(|| {
+            AppError::TooManyRequests(
+                "上一次清理还在进行中或刚结束（两次主动清理至少间隔 60 秒），请稍候".into(),
+            )
+        })??;
 
-    let result = sweeper::cleanup_orphans(&pool, &config).await;
-    RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
-
-    let stats = result?;
     Ok(Json(json!({
         "success": true,
         "data": stats,

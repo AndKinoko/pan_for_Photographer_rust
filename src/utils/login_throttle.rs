@@ -32,7 +32,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// 同一维度连续失败多少次后开始退避。
-const THRESHOLD: u32 = 5;
+///
+/// `pub(crate)` 是为了让 HTTP 层测试能引用它，而不是在断言里抄一个魔数——
+/// 抄了之后一旦这里调整，测试会继续「通过」但语义已经变了。
+pub(crate) const THRESHOLD: u32 = 5;
 /// 首次退避的时长（秒）。
 ///
 /// 原先是 2^0 = 1 秒，那对人毫无意义：输错 5 次密码只被挡 1 秒，

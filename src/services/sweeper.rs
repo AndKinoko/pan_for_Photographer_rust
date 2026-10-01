@@ -1,5 +1,6 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sqlx::SqlitePool;
@@ -8,11 +9,32 @@ use tokio::sync::Semaphore;
 use crate::config::Config;
 use crate::services::preview_service;
 
-/// 孤儿文件（uuid 无对应 DB 行）的老化宽限：仅删除 mtime 超过该时长的文件。
-/// 保护上传在途（rename 后尚未 INSERT）与缩略图生成中（已落盘尚未 UPDATE）的窗口。
-const ORPHAN_GRACE: Duration = Duration::from_secs(5 * 60); // 5 分钟
+/// 孤儿文件（uuid 无对应 DB 行）的老化宽限：**仅删除 mtime 超过该时长的文件**。
+///
+/// 这个宽限期是**唯一**在保护上传提交窗口的东西，所以取值必须大于
+/// 「最慢一次上传的耗时」，否则会把刚传完的文件当成孤儿删掉：
+///
+/// 上传流程是 `File::create(.part)` → 流式写入 → `rename` 到最终路径 → `INSERT`。
+/// `rename` 保留原 mtime，即 **mtime 等于上传开始时刻**。于是只要上传耗时超过
+/// 宽限期，`rename` 完成的那一刻文件就已经「超龄」；若 GC 恰好在此刻扫过磁盘、
+/// 又在 INSERT 之前查库，这个文件就会被判定为孤儿删除 —— 随后 INSERT 成功，
+/// 留下一条指向不存在文件的记录（下载 404、预览永久失败）。
+///
+/// 原先取 5 分钟，只覆盖了「5 分钟内传完」的情形，而家用宽带上一个 10GB 原片
+/// 传 20 分钟以上很常见。取 1 小时可以覆盖 10GB @ 约 22 Mbit/s 及以上的上行；
+/// 再慢的上传仍有窗口，代价则是孤儿多留一小时 —— 而孤儿清理本来 24 小时才跑一次，
+/// 这点延迟毫无影响。
+const ORPHAN_GRACE: Duration = Duration::from_secs(60 * 60); // 1 小时
 /// .part 临时文件的老化宽限：单独放大到 1 小时，避免慢 WiFi 大文件上传被误删。
 const PART_GRACE: Duration = Duration::from_secs(60 * 60); // 1 小时
+
+/// 两次**主动**孤儿清理之间的最小间隔。
+///
+/// 主动清理（管理端按钮 / 清空回收站后的即时清理）每次都要遍历整个 uploads/
+/// 目录树，是纯 IO 开销。没有这道闸时，任何已发出的账号循环调
+/// `DELETE /api/trash` 就能让服务端持续全盘扫描。60 秒足够让「刚删完想立刻
+/// 回收空间」的体验不受影响，同时把放大倍数压到 1/60 以下。
+const MIN_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// 预览生成的最大尝试次数：达到后 GC 不再重投该文件。
 ///
@@ -94,6 +116,10 @@ pub struct CleanupStats {
 /// 不是正常产物，所以稀疏清理足够——孤儿在磁盘上多放 24 小时没有任何危害。
 ///
 /// 与 [`retry_missing_previews`] 分开的原因见 [`start`] 的注释。
+///
+/// **调用方几乎总是该用 [`cleanup_orphans_throttled`]。** 本函数自身不做任何
+/// 并发或频率保护，直接暴露出去等于把「全盘扫一遍」变成一个可被任意账号
+/// 无限触发的操作。
 pub async fn cleanup_orphans(pool: &SqlitePool, config: &Config) -> Result<CleanupStats, sqlx::Error> {
     let t = std::time::Instant::now();
 
@@ -226,6 +252,55 @@ pub async fn cleanup_orphans(pool: &SqlitePool, config: &Config) -> Result<Clean
     })
 }
 
+/// 主动孤儿清理的统一入口：**全局互斥 + 最小间隔**。
+///
+/// 管理端的清理按钮与用户侧「清空回收站后的即时清理」都走这里，
+/// 两者此前各自为政：管理端有 `AtomicBool` 互斥（还写了注释说明理由），
+/// 用户侧却裸调 `cleanup_orphans`，于是任意已发出的账号都能循环触发全盘扫描。
+///
+/// 返回 `None` 表示本次跳过，原因有二，调用方不必区分：
+/// · 已有一次清理在跑（互斥）；
+/// · 距上次清理不足 [`MIN_CLEANUP_INTERVAL`]。
+pub async fn cleanup_orphans_throttled(
+    pool: &SqlitePool,
+    config: &Config,
+) -> Option<Result<CleanupStats, sqlx::Error>> {
+    // 互斥先抢，抢不到立刻返回——不能等，等就等于把请求排成队继续打满 IO。
+    if CLEANUP_RUNNING.swap(true, Ordering::SeqCst) {
+        return None;
+    }
+    // 无论怎么退出（含 panic 展开）都要把标志放回去，否则清理入口会被永久锁死。
+    let _running = RunningGuard;
+
+    {
+        let last = LAST_CLEANUP.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = *last {
+            if t.elapsed() < MIN_CLEANUP_INTERVAL {
+                return None;
+            }
+        }
+    }
+
+    let result = cleanup_orphans(pool, config).await;
+
+    // 用「开始时刻」还是「结束时刻」记账差别不大，这里记结束时刻：
+    // 一次扫描跑很久时，下一次至少还能在它结束后 60 秒开始。
+    *LAST_CLEANUP.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    Some(result)
+}
+
+static CLEANUP_RUNNING: AtomicBool = AtomicBool::new(false);
+static LAST_CLEANUP: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// 作用域结束时复位互斥标志。
+struct RunningGuard;
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        CLEANUP_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
 /// 补生成缺失的缩略图。**高频**：每 10 分钟一次，只查库不扫磁盘。
 ///
 /// 与 [`cleanup_orphans`] 分开的理由：缩略图生成失败（磁盘抖动、内存不足）
@@ -241,11 +316,23 @@ pub async fn retry_missing_previews(
     // 只对「支持预览」且「未超过尝试上限」的行重投：
     // 生成失败时 preview_path 会保持 NULL，若不设上限，同一个失败文件会被每轮 GC
     // 反复解码（历史上配合 RAW 的全量读盘会变成周期性 OOM）。
+    //
+    // 另外两条过滤都不能省：
+    // · `deleted_at IS NULL`——回收站里的文件不该再花 CPU 生成预览，用户已经
+    //   不要它了；它们还留在库里的唯一原因是「可恢复」。
+    // · 支持的类型白名单——视频/压缩包这类永远不支持预览的类型（`preview_path`
+    //   恒为 NULL）此前每 10 分钟就被整表捞出来一次，在 `supports_preview`
+    //   里再被逐条跳过。判定下沉到 SQL，几万条视频时省下的是每次全表扫描。
+    //   白名单随 `file_service` 走，两边不会各自漂移。
+    let previewable = serde_json::to_string(&crate::services::file_service::previewable_types())
+        .unwrap_or_else(|_| "[]".into());
     let pending: Vec<(i64, String, String, i64)> = sqlx::query_as(
         "SELECT id, stored_path, file_type, owner_id FROM files \
-         WHERE preview_path IS NULL AND preview_attempts < ?",
+         WHERE preview_path IS NULL AND preview_attempts < ? AND deleted_at IS NULL \
+           AND lower(file_type) IN (SELECT value FROM json_each(?))",
     )
     .bind(MAX_PREVIEW_ATTEMPTS)
+    .bind(&previewable)
     .fetch_all(pool)
     .await?;
     if !pending.is_empty() {

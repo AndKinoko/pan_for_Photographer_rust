@@ -45,12 +45,23 @@ services:
   #   docker compose run --rm cloudflared tunnel login
   #   docker compose run --rm cloudflared tunnel create pan-delivery
   # 然后把返回的隧道 ID 填进 deploy.env 的 TUNNEL_ID。
+  #
+  # 注意这里**不写 `${TUNNEL_ID:?...}`**。整个 compose 文件是先插值再按
+  # profile 选服务的，所以那种「缺了就报错」的写法会对**所有**服务生效——
+  # 哪怕你只想跑 app-dev 调试，只要 TUNNEL_ID 没填，compose 就直接拒绝解析，
+  # 报的还是一条指向 cloudflared 的错，和你想启动的服务毫无关系（实测踩过）。
+  #
+  # 改成 `:-` 给个空默认值之后，缺凭据的后果被推回到运行时，而且报得清楚：
+  # cloudflared 自己会打印「没有隧道凭据」，不会连累 app / app-dev。
+  #
+  # 安全上没有任何让步：真正的边界是 app 不映射端口（见文件头），
+  # 而不是这条校验。cloudflared 没凭据就跑不起来，也就不可能把流量导进来。
   cloudflared:
     image: cloudflare/cloudflared:latest
     restart: unless-stopped
     command: tunnel --no-autoupdate run
     environment:
-      TUNNEL_ID: ${TUNNEL_ID:?请在 deploy.env 里设置 TUNNEL_ID}
+      TUNNEL_ID: ${TUNNEL_ID:-}
       # token 方式登录（dashboard 创建的隧道会给出）。
       # 与 TUNNEL_ID 二选一：命名隧道用 login + config 方式，
       # 快速隧道（trycloudflare）则完全不需要下面任何一项。
@@ -59,6 +70,7 @@ services:
       app:
         condition: service_healthy
     networks: [pan-net]
+    profiles: ["tunnel"]
 
   # ── 本机调试入口（opt-in）────────────────────────────────────
   # 默认**不启动**：它存在的唯一目的是让开发机能在浏览器里打开

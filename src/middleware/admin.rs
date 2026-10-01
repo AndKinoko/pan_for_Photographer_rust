@@ -15,6 +15,10 @@ use sqlx::SqlitePool;
 #[derive(Debug, Clone)]
 pub struct AdminUser {
     pub user_id: i64,
+    /// 当前没有 handler 读它（与 `AuthUser` 同名同因），保留是为了让
+    /// 「已认证的管理员是谁」这一信息在提取器边界上完整，日志与将来的
+    /// 审计埋点都要用到。
+    #[allow(dead_code)]
     pub username: String,
 }
 

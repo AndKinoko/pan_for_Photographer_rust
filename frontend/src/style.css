@@ -213,6 +213,40 @@ textarea::placeholder {
   color: var(--text-muted);
 }
 
+/* ---------------------------------------------------------------------------
+   隐藏浏览器内置的密码按钮
+   ---------------------------------------------------------------------------
+   我们在 PasswordInput.vue 里自带了一个显示/隐藏切换按钮。但 Edge 和
+   Chromium 在 `type="password"` 且**输入框非空**时，会再画一个自己的图标 ——
+   于是用户看到两个眼睛，一个永远在、一个打完第一个字符才出现。
+
+   更麻烦的是两者**语义不同**：我们的是 show/hide 切换，浏览器那个是**清空**。
+   用户点后者以为在切换明文，实际把刚输入的密码删了。它在「分享密码」
+   「给客户设初始密码」这类一次性输入场景里是真实的数据丢失。
+
+   因此隐藏原生的，只留我们自己的（它有 aria-label / aria-pressed / 主题着色 /
+   44×44 触屏热区，浏览器那个一样都没有）。Element Plus 与 Ant Design 在自带
+   回显按钮时也是这么做的，不是本项目独创的取舍。
+
+   下面两组互不干扰：Chromium 不解析 ::-ms-*，Edge 也不解析 ::-webkit-* 这两个。
+   故并列写是安全的，分开列只是为了说明各自归属。
+
+   Safari 的钥匙串图标与 Firefox 的（Firefox 根本没有原生按钮）没有对应伪元素，
+   这里管不到；Safari 那个是系统级的，属于用户预期内的存在。
+   --------------------------------------------------------------------------- */
+
+/* Edge / 旧 IE */
+input::-ms-reveal,
+input::-ms-clear {
+  display: none;
+}
+
+/* Chromium：密码管理器图标 + 强密码建议按钮 */
+input::-webkit-credentials-auto-fill-button,
+input::-webkit-strong-password-auto-fill-button {
+  display: none;
+}
+
 /* ---------- Reusable component primitives ---------- */
 
 .btn {

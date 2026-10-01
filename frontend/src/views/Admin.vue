@@ -33,6 +33,8 @@ const cUsernameEl = ref(null)
 const cPasswordEl = ref(null)
 const cQuotaEl = ref(null)
 const eUsernameEl = ref(null)
+/** 编辑弹窗打开时该用户的原始角色（判断是否要锁住角色选择） */
+const eOriginalRole = ref('')
 const ePasswordEl = ref(null)
 const eQuotaEl = ref(null)
 
@@ -213,6 +215,9 @@ function openEdit(user) {
   eForm.id = user.id
   eForm.username = user.username
   eForm.role = user.role
+  // 记下编辑前的角色：后端不允许把管理员改成普通用户，界面上直接锁死
+  // 那一档，别让用户点了才知道。
+  eOriginalRole.value = user.role
   eForm.password = ''
   eForm.expires_at = toLocalInput(user.expires_at)
   eForm.keepExpiry = true
@@ -662,9 +667,16 @@ onMounted(() => {
                 >你</span>
               </td>
               <td>
+                <!-- 管理员不可降级（后端同样会拒）。与其让用户点了再吃一个
+                     400，不如把「不可选」直接摆出来：这里的 select 只允许
+                     从「普通用户」改成「管理员」，admin 那一档被禁用。
+                     自降级曾被误触过——唯一的管理员把自己设成普通用户之后
+                     就没有任何入口改回来了。 -->
                 <select
                   class="role-select"
                   :value="u.role"
+                  :disabled="u.role === 'admin'"
+                  :title="u.role === 'admin' ? '管理员不可降级，如需移除请删除该账号' : ''"
                   @change="onRoleChange(u, $event)"
                 >
                   <option value="user">普通用户</option>
@@ -960,7 +972,13 @@ onMounted(() => {
         </div>
         <div class="field">
           <label for="edit-role">角色</label>
-          <select id="edit-role" v-model="eForm.role" class="select">
+          <select
+            id="edit-role"
+            v-model="eForm.role"
+            class="select"
+            :disabled="eOriginalRole === 'admin'"
+            :title="eOriginalRole === 'admin' ? '管理员不可降级，如需移除请删除该账号' : ''"
+          >
             <option value="user">普通用户</option>
             <option value="admin">管理员</option>
           </select>

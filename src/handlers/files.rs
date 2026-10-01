@@ -73,7 +73,10 @@ pub(crate) fn content_disposition(disposition: &str, filename: &str) -> String {
     let ascii_fallback: String = filename
         .chars()
         .map(|c| {
-            if c.is_ascii() && c != '"' && c != '\\' {
+            // 控制字符一并换成 `_`：CR/LF 会让 `HeaderValue` 构造失败（500），
+            // 而这里**不能依赖上游 `sanitize_filename` 已经拦过**——存量数据
+            // 可能早于那次校验入库，把安全性押在「历史数据都干净」上不是个好赌注。
+            if c.is_ascii() && !c.is_control() && c != '"' && c != '\\' {
                 c
             } else {
                 '_'
@@ -362,7 +365,9 @@ pub async fn upload_files(
 
     // 阶段 2：提交已流式落盘的待处理文件（.part -> rename 原子提交 + INSERT）
     for pu in pending {
-        // 重复检查（此时已能确定 owner/folder）
+        // 重复检查（此时已能确定 owner/folder）。这一步是**快路径**：提早发现
+        // 重名可以省掉一次 rename + 回滚。它不是安全边界——真正的判定在下面对
+        // INSERT 的 `NOT EXISTS` 里，原因见那段注释。
         if file_service::check_duplicates(&pool, owner_id, folder_id, &pu.file_name).await? {
             errors.push(format!("文件 \"{}\" 已存在，已跳过", pu.file_name));
             // pu 的 guard Drop 移除临时 .part
@@ -381,24 +386,38 @@ pub async fn upload_files(
         })?;
         tokio::fs::rename(&src, &full_path).await?;
 
-        // 配额校验与 INSERT 收进**同一条语句**，由数据库裁决。
+        // 配额校验、重名校验与 INSERT 收进**同一条语句**，由数据库裁决。
         //
-        // 原来是「先 SELECT SUM 再判断、然后单独 INSERT」，两个并发请求会读到
-        // **同一个** used 值、都判定通过，各自 INSERT——实测 3MB 配额下 8 个
-        // 并发 900KB 请求写入了 6.15MB，超配额一倍。
+        // 配额部分：原来是「先 SELECT SUM 再判断、然后单独 INSERT」，两个并发
+        // 请求会读到**同一个** used 值、都判定通过，各自 INSERT——实测 3MB 配额下
+        // 8 个并发 900KB 请求写入了 6.15MB，超配额一倍。改成
+        // `INSERT ... SELECT ... WHERE used + ? <= quota` 后，判定和写入在同一条
+        // SQL 里，SQLite 保证单条语句的原子性，读到的 used 与写入的行之间没有窗口。
         //
-        // 改成 `INSERT ... SELECT ... WHERE used + ? <= quota`：判定和写入在
-        // 同一条 SQL 里，SQLite 保证单条语句的原子性，读到的 used 与写入的
-        // 行之间不存在窗口。返回 0 行即表示超配额。
+        // 配额口径用 `DISTINCT stored_path` 而不是裸 `SUM(size)`：批量复制会插入
+        // 共享同一物理文件的多行（见 `batch_service::batch_copy`），裸 SUM 会把
+        // 同一份字节按副本数重复计入，于是「复制一次 → 用量翻倍 → 传不上新文件」，
+        // 而磁盘占用其实一点没变。详见 `file_service::used_bytes`。
         //
-        // WHERE 里的 SUM 在 INSERT 执行瞬间求值，与其他写事务互斥（WAL 下
-        // 写是全库串行的），因此并发请求会依次看到彼此已提交的文件。
+        // 重名部分：`check_duplicates` 与 INSERT 之间原本有窗口，两个并发上传
+        // 同名文件会双双入库。表面上只是列表里出现两个同名项，但「同名唯一」
+        // 是交互契约，破坏它没有任何收益——把 `NOT EXISTS` 并进同一条语句
+        // 就等于零成本地补上这个约束。
+        //
+        // 返回 0 行有三种可能（超配额 / 重名 / 两者皆是），下面再查一次区分，
+        // 只为给用户一句准确的话，判定本身仍由这条语句完成。
         let file_record = sqlx::query_as::<_, File>(
             r#"
             INSERT INTO files (name, original_name, stored_path, preview_path, thumb_path,
                                owner_id, folder_id, size, file_type)
             SELECT ?, ?, ?, NULL, NULL, ?, ?, ?, ?
-            WHERE (SELECT COALESCE(SUM(size), 0) FROM files WHERE owner_id = ?) + ? <= ?
+            WHERE (SELECT COALESCE(SUM(size), 0) FROM
+                       (SELECT DISTINCT stored_path, size FROM files WHERE owner_id = ?)) + ? <= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM files
+                  WHERE owner_id = ? AND folder_id IS ? AND lower(original_name) = lower(?)
+                    AND deleted_at IS NULL
+              )
             RETURNING *
             "#,
         )
@@ -412,16 +431,25 @@ pub async fn upload_files(
         .bind(owner_id)
         .bind(pu.size)
         .bind(quota_bytes)
+        .bind(owner_id)
+        .bind(folder_id)
+        .bind(&pu.file_name)
         .fetch_optional(&pool)
         .await;
 
         let file_record = match file_record {
             Ok(Some(r)) => r,
             Ok(None) => {
-                // 超配额：物理文件已 rename，但库里没有记录。
-                // 立刻删掉它——否则会留下一个 GC 也要等 5 分钟才清理的孤儿。
+                // 未写入：物理文件已 rename，但库里没有记录。
+                // 立刻删掉它——否则会留下一个 GC 也要等宽限期才清理的孤儿。
                 let _ = tokio::fs::remove_file(&full_path).await;
-                errors.push(format!("文件 \"{}\" 超出网盘配额，已跳过", pu.file_name));
+                if file_service::check_duplicates(&pool, owner_id, folder_id, &pu.file_name)
+                    .await?
+                {
+                    errors.push(format!("文件 \"{}\" 已存在，已跳过", pu.file_name));
+                } else {
+                    errors.push(format!("文件 \"{}\" 超出网盘配额，已跳过", pu.file_name));
+                }
                 // pu 的 guard Drop 也会尝试清理（此时 path 已被 rename 走，
                 // RemoveFileGuard 找不到文件会静默跳过）
                 continue;
@@ -512,17 +540,25 @@ fn spawn_preview_task(
     });
 }
 
-/// 解析出「本次请求代表哪个用户」，供 `?token=` 旁路的下载/预览接口使用。
+/// 解析出「本次请求代表哪个用户」，供 `?ticket=` 旁路的下载/预览接口使用。
 ///
-/// 这两个接口要支持把令牌放进查询参数，是因为 `<img src>` 与下载链接无法带
+/// 这两个接口要支持把凭据放进查询参数，是因为 `<img src>` 与下载链接无法带
 /// Authorization 头（`frontend/src/api.js` 的 `authUrl()` 就是这么拼的）。
 ///
-/// 但**令牌在查询参数里不等于可以只验签名**：验签只能证明「这令牌是我们签的、
-/// 且没超 7 天」，证明不了「签发者现在还有权限」。账号到期后，旧链接在 7 天内
-/// 一直能解出 user_id 而畅通无阻——这正是缺陷 1。
+/// **这里是媒体票据而不是 JWT。** 原先拼进 URL 的是 JWT 本身，而 JWT 是
+/// 7 天有效期的全权限凭据（能调管理端、能删文件），URL 又会被边缘日志、
+/// 浏览器历史完整记录 —— 一次缩略图加载就等于把账号钥匙抄进三处日志。
+/// 换成 [`crypto::create_media_ticket`] 之后，同一位置泄漏出来的东西
+/// 只能读取一个用户的媒体，且 2 小时后失效。
 ///
-/// 所以此处与 `AuthUser` 提取器一样，验签之后必须**再查库**确认账号仍然有效。
-/// 两条路径共用 `account_guard`，避免同一套规则各写一份再次跑偏。
+/// 但**凭据类型变了不等于可以只验签名**：验签只能证明「这票据是我们签的、
+/// 且没超 2 小时」，证明不了「签发者现在还有权限」。账号到期后，旧链接在
+/// 票据有效期内仍能解出 user_id 而畅通无阻。所以此处与 `AuthUser` 提取器
+/// 一样，验签之后必须**再查库**确认账号仍然有效。两条路径共用
+/// `account_guard`，避免同一套规则各写一份再次跑偏。
+///
+/// 授权边界没有放宽：票据只回答「你是谁」，文件归属仍由 SQL 里的
+/// `owner_id = ?` 把关（见 `file_service::get_file`）。
 async fn resolve_user_id(
     pool: &SqlitePool,
     config: &Config,
@@ -531,10 +567,9 @@ async fn resolve_user_id(
 ) -> Result<i64, AppError> {
     let user_id = if let Some(user) = auth {
         user.user_id
-    } else if let Some(token) = params.get("token") {
-        crate::utils::crypto::validate_token(token, config)
-            .map_err(|_| AppError::Unauthorized("无效的访问令牌".into()))?
-            .sub
+    } else if let Some(ticket) = params.get("ticket") {
+        crate::utils::crypto::verify_media_ticket(config, ticket)
+            .ok_or_else(|| AppError::Unauthorized("访问凭证无效或已过期".into()))?
     } else {
         return Err(AppError::Unauthorized("请先登录".into()));
     };
@@ -543,7 +578,7 @@ async fn resolve_user_id(
     Ok(user_id)
 }
 
-/// GET /api/files/:id/download?token=<jwt> 下载文件
+/// GET /api/files/:id/download?ticket=<media-ticket> 下载文件
 pub async fn download_file(
     State(pool): State<SqlitePool>,
     State(config): State<Config>,
@@ -585,7 +620,7 @@ pub async fn download_file(
     Ok(response)
 }
 
-/// GET /api/files/:id/media?preview=1&token=<jwt> 提供媒体文件服务
+/// GET /api/files/:id/media?preview=1&ticket=<media-ticket> 提供媒体文件服务
 pub async fn serve_media(
     State(pool): State<SqlitePool>,
     State(config): State<Config>,
@@ -819,11 +854,20 @@ pub async fn empty_trash(
 ) -> Result<Json<Value>, AppError> {
     let file_count = file_service::empty_trash(&pool, auth.user_id).await?;
 
-    // 触发一次即时 GC，立即释放本次硬删产生的磁盘空间（无需等周期任务）
+    // 触发一次即时 GC，立即释放本次硬删产生的磁盘空间（无需等周期任务）。
+    //
+    // **必须走 throttled 入口**。原先这里是无条件 `tokio::spawn(cleanup_orphans)`，
+    // 而 `cleanup_orphans` 会遍历整个 uploads/ 目录树做一次全盘对账 —— 于是
+    // 任何一个已发出的账号（哪怕配额为 0、一个文件都没有）只要循环调
+    // `DELETE /api/trash`，就能让服务端持续做全盘扫描，把磁盘 IO 打满。
+    // 管理端的同名入口一直有互斥保护，用户侧这条漏了同一层。
     tokio::spawn(async move {
         // 只跑孤儿对账，不重投缩略图——用户刚删完的磁盘空间要立刻释放
-        if let Err(e) = crate::services::sweeper::cleanup_orphans(&pool, &config).await {
-            tracing::warn!("清空回收站后的即时清理失败: {:?}", e);
+        match crate::services::sweeper::cleanup_orphans_throttled(&pool, &config).await {
+            Some(Err(e)) => tracing::warn!("清空回收站后的即时清理失败: {:?}", e),
+            // None = 已有清理在跑，或距上次不足最小间隔。两种都直接跳过。
+            None => tracing::debug!("即时清理被节流跳过（有清理在跑或间隔不足）"),
+            _ => {}
         }
     });
 

@@ -10,19 +10,28 @@
 ```bash
 # 1. 准备配置（唯一需要改的文件）
 cp deploy.env.example deploy.env
-#    编辑 deploy.env：至少填 TUNNEL_ID / TUNNEL_TOKEN 与 CORS_ALLOWED_ORIGINS
+#    编辑 deploy.env：至少填 TUNNEL_ID / TUNNEL_TOKEN 与 SEED_ADMIN_PASSWORD
+#    （SEED_ADMIN_PASSWORD 留空就不建管理员，而注册要邀请码 —— 会进不去管理端）
 
-# 2. 生成 JWT 密钥（缺了它容器会 panic 重启）
-mkdir -p data
-docker run --rm -v "$(pwd)/data:/data" alpine \
-  sh -c 'head -c 48 /dev/urandom | base64 > /data/secret.key && chmod 600 /data/secret.key'
+# 2. 构建镜像
+docker build -t pan-for-photographer:latest .
 
-# 3. 构建并启动
-docker compose --env-file deploy.env up -d --build
+# 3. 生成 JWT 密钥（缺了它容器会 panic 重启）
+#    ⚠️ compose 用的是 **named volume**（pan-data），不是宿主机上的 ./data 目录。
+#    所以不能 `docker run -v "$(pwd)/data:/data"` 那样在宿主机建文件 —— 容器根本
+#    看不到它。必须写进卷里，用刚构建好的镜像起一个一次性容器来写：
+docker compose --env-file deploy.env run --rm --no-deps --entrypoint sh app -c \
+  '[ -f /data/secret.key ] || (head -c 48 /dev/urandom | base64 > /data/secret.key && chmod 600 /data/secret.key)'
 
-# 4. 确认没有对外暴露端口（这条是安全的关键）
+# 4. 启动
+docker compose --env-file deploy.env up -d
+
+# 5. 确认没有对外暴露端口（这条是安全的关键）
 docker compose ps        # PORTS 列应为空
 ```
+
+> Windows 用户不必手敲这三步：`docker_start_server.bat` 已经把它们串好了，
+> 而且用的正是上面这条「写进卷里」的方式。
 
 ### ⚠️ 还有一步在 Cloudflare 那边，不在本地
 
@@ -60,6 +69,7 @@ Zero Trust → Networks → Tunnels → 点你的隧道 → **Public Hostname** 
 | `DATABASE_PATH` / `UPLOAD_DIR` / `JWT_SECRET_KEY_FILE` | 都在 `/data`（同一个卷） |
 | `STATIC_DIR` | `/app/static`（镜像内已构建好） |
 | `MAX_FILE_SIZE` | 单文件上限，默认 10GB |
+| `SEED_ADMIN_USERNAME` / `SEED_ADMIN_PASSWORD` | 初始管理员。**密码留空则不创建任何管理员**，而注册需要邀请码 —— 结果是进不去管理端 |
 | `CORS_ALLOWED_ORIGINS` | **公网部署必须填自己的域名** |
 | `TUNNEL_ID` / `TUNNEL_TOKEN` | 隧道凭据，只在 compose 里用 |
 
@@ -157,12 +167,20 @@ docker compose exec app sh    # 进容器
 ## 6. 还没做的
 
 - **分片上传**：Cloudflare 单请求 100MB 上限是硬约束，前端目前是单请求整文件上传
-  （`frontend/src/api.js` 的 `uploadFiles`）。需要大文件不受限就得改成分片。
-- **SPA fallback 补全**：`/admin`、`/search`、`/trash` 直接访问或刷新会 404
-  （`src/main.rs` 只给 `/share/*` 挂了 fallback）。局域网里容易忽略，公网上会误报「打不开」。
-- **TraceLayer 不记 query**：`frontend/src/api.js` 把 JWT 拼进缩略图 URL，
-  而 `src/main.rs` 的 `TraceLayer::new_for_http()` 默认记录 URI → **7 天有效期的
-  bearer token 明文进日志**。公网部署前应改掉。
+  （`frontend/src/composables/useTransfer.js` 的 `runUpload`）。需要大文件不受限
+  就得改成分片。
 - **Cloudflare Access 保护 `/admin`**：Access 默认拒绝，可用路径规则单独保护
   管理端。注意官方警告：**先建 Access application，再配 tunnel route**，
   否则配好隧道前应用对全互联网开放。
+- **前端无自动化测试**：`frontend/package.json` 只有 `dev` / `build` / `preview`。
+
+### 已修复（本节此前列为待办，保留记录避免重复排查）
+
+- **SPA 深链**：`/admin`、`/search`、`/trash`、`/shares` 及任意前端路由直接访问
+  或刷新现在都会回退到 `index.html`（`src/main.rs` 用 `ServeDir::fallback`，
+  未匹配的 `/api/` 路径仍返回 JSON 404）。若又出现 404，先确认 `STATIC_DIR`
+  下真的有 `index.html` —— 回退服务找不到它就只返回 404。
+- **凭据不再进 URL**：缩略图/下载链接原先拼的是 JWT 本身，现改为 2 小时有效、
+  仅对媒体/下载接口生效的**媒体访问凭证**（`utils::crypto::create_media_ticket`）。
+  应用日志与 `Referrer-Policy: no-referrer` 两道都在，但**边缘日志仍会记录完整
+  URL**：如需进一步收敛，可在 Cloudflare 侧关闭对该路径的 query 记录。

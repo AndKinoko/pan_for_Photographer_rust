@@ -69,8 +69,6 @@ WORKDIR /app
 COPY --from=backend /src/target/release/pan_for_photographer /app/pan
 # 前端构建产物。STATIC_DIR 指向这里。
 COPY --from=frontend /build/static /app/static
-# 只读交付端（static_user），如需以它对外服务可另行挂载 STATIC_DIR。
-COPY static_user /app/static_user
 # 备份脚本。放进镜像而不是让人手敲 —— 备份命令里的引号转义很容易出错，
 # 而「备份了却恢复不出来」恰恰是最坏的故障形态，不能靠手敲。
 COPY backup.sh /app/backup.sh

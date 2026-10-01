@@ -81,11 +81,15 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .await
         .ok();
 
+    // 分享：一批条目由 share_items 承载，本表只留「批次」本身的属性。
+    //
+    // 历史上这里是 `file_id INTEGER NOT NULL` + 后来补的 `folder_id`，
+    // 一个分享只能指向**一个**文件或**一个**文件夹。改成批次之后两个列都没有意义，
+    // 下面的迁移块负责把旧结构换成这个。
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS file_shares (
             id TEXT PRIMARY KEY,
-            file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
             owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             created_at DATETIME NOT NULL DEFAULT (datetime('now')),
             expires_at DATETIME,
@@ -99,7 +103,6 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .await?;
 
     // === 新增列迁移（向后兼容，已存在则忽略） ===
-
     // 用户角色（user / admin）
     sqlx::query("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
         .execute(pool)
@@ -122,6 +125,21 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 
     // 文件软删除
     sqlx::query("ALTER TABLE files ADD COLUMN deleted_at DATETIME")
+        .execute(pool)
+        .await
+        .ok();
+
+    // 文件是「被父文件夹连带删掉」还是「用户单独删的」。
+    //
+    // 必要性：这两种删除在 `files` 表里长得一模一样（都只是 deleted_at 非空），
+    // 而恢复时行为必须不同 —— 恢复文件夹只该复活跟着它一起进回收站的文件，
+    // 不该把用户此前单独删掉的文件一起复活（那看起来就是「我从没要恢复的东西
+    // 自己回来了」）。反向同理：永久删除文件夹不该硬删用户单独删除的文件，
+    // 那些文件本该还能从回收站恢复。
+    //
+    // 存的是当时所在文件夹的 id（不是布尔值）：便于诊断，也便于将来做
+    // 「这棵子树里哪些文件是跟着一起删的」。NULL 表示单独删除。
+    sqlx::query("ALTER TABLE files ADD COLUMN deleted_with_folder_id INTEGER")
         .execute(pool)
         .await
         .ok();
@@ -157,6 +175,122 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await
         .ok();
+
+    // === 分享从「一个目标」改成「一批条目」 ===
+    //
+    // 新模型：`share_items(share_id, item_type, item_id)` 承载批次内容，
+    // `file_shares` 只留批次自身的属性。文件和文件夹可以混装、可以有多个。
+    //
+    // **必须重建 `file_shares`**，不能只加新表：旧的 `file_id` 是
+    // `INTEGER NOT NULL REFERENCES files(id)`，不提供它 INSERT 就会失败，
+    // 而「只含文件夹的批次」根本拿不出一个合法的 file_id 来填。
+    // SQLite 又改不了列上的 NOT NULL，只能整表重建。
+    //
+    // 顺序是刻意的，有两个坑：
+    //   1. 先把旧的两列读进**内存**再重建。不能用临时表——sqlx 的连接池会让
+    //      相邻两条语句落在不同连接上，而临时表是连接级的，第二条就找不到了。
+    //   2. `share_items` 必须在重建**之后**才创建。它带
+    //      `REFERENCES file_shares(id) ON DELETE CASCADE`，若先建好，
+    //      后面 `DROP TABLE file_shares` 会顺着外键把刚迁移过去的条目全删掉。
+    {
+        let legacy_has_file_id: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('file_shares') WHERE name = 'file_id'",
+        )
+        .fetch_one(pool)
+        .await?;
+
+        let legacy_rows: Vec<(String, Option<i64>, Option<i64>)> = if legacy_has_file_id > 0 {
+            sqlx::query_as("SELECT id, file_id, folder_id FROM file_shares")
+                .fetch_all(pool)
+                .await?
+        } else {
+            Vec::new()
+        };
+
+        if legacy_has_file_id > 0 {
+            sqlx::query(
+                r#"
+                CREATE TABLE file_shares_new (
+                    id TEXT PRIMARY KEY,
+                    owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+                    expires_at DATETIME,
+                    password_hash TEXT NOT NULL DEFAULT '',
+                    download_count INTEGER NOT NULL DEFAULT 0,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    max_downloads INTEGER,
+                    custom_code TEXT
+                );
+                "#,
+            )
+            .execute(pool)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO file_shares_new
+                     (id, owner_id, created_at, expires_at, password_hash,
+                      download_count, is_active, max_downloads, custom_code)
+                 SELECT id, owner_id, created_at, expires_at, password_hash,
+                        download_count, is_active, max_downloads, custom_code
+                 FROM file_shares",
+            )
+            .execute(pool)
+            .await?;
+
+            sqlx::query("DROP TABLE file_shares").execute(pool).await?;
+            // RENAME 会把其它表里指向它的外键一并改写（SQLite ≥ 3.25），
+            // 所以这一步之后 `share_items` 的引用会落到正确的表上。
+            sqlx::query("ALTER TABLE file_shares_new RENAME TO file_shares")
+                .execute(pool)
+                .await?;
+
+            tracing::info!("file_shares 已重建为批次结构");
+        }
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS share_items (
+                share_id  TEXT    NOT NULL REFERENCES file_shares(id) ON DELETE CASCADE,
+                item_type TEXT    NOT NULL CHECK (item_type IN ('file','folder')),
+                item_id   INTEGER NOT NULL,
+                PRIMARY KEY (share_id, item_type, item_id)
+            );
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        // 把旧的两个列搬进关联表。`OR IGNORE` 让重复执行安全。
+        for (share_id, file_id, folder_id) in legacy_rows {
+            if let Some(fid) = file_id {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO share_items (share_id, item_type, item_id) VALUES (?, 'file', ?)",
+                )
+                .bind(&share_id)
+                .bind(fid)
+                .execute(pool)
+                .await?;
+            }
+            if let Some(fid) = folder_id {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO share_items (share_id, item_type, item_id) VALUES (?, 'folder', ?)",
+                )
+                .bind(&share_id)
+                .bind(fid)
+                .execute(pool)
+                .await?;
+            }
+        }
+
+        // `batch/unshare` 要按条目反查「哪些分享包含它」，需要这个方向的索引；
+        // 主键 (share_id, item_type, item_id) 只覆盖 share_id 开头的前缀。
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_share_items_item ON share_items(item_type, item_id)",
+        )
+        .execute(pool)
+        .await
+        .ok();
+    }
 
     // === 注册邀请码 ===
     //
@@ -205,6 +339,15 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await
         .ok();
+    // 配额统计（`file_service::used_bytes` 与上传时那条 INSERT ... WHERE）
+    // 按 `DISTINCT stored_path` 求和。这个覆盖索引让该聚合走纯索引扫描，
+    // 不必回表、也不必为 DISTINCT 建临时 B 树 —— 上传时每个文件都会跑一次它。
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_files_owner_stored ON files(owner_id, stored_path, size)",
+    )
+    .execute(pool)
+    .await
+    .ok();
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_folders_deleted ON folders(deleted_at)")
         .execute(pool)
         .await

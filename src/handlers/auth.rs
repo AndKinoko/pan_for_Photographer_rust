@@ -34,6 +34,32 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+/// 媒体访问凭证的有效期（秒）。默认 2 小时。
+///
+/// 短时效是这套凭证存在的意义：它取代 JWT 出现在缩略图/下载链接的查询串里，
+/// 而查询串会被边缘日志、浏览器历史完整记录。口径收窄 + 时效缩短，
+/// 即便泄漏，损失也远小于一枚 7 天全权限 JWT。
+pub const MEDIA_TICKET_TTL_SECS: i64 = 2 * 60 * 60;
+
+/// 把媒体访问凭证挂到响应数据上。
+///
+/// 登录 / 注册 / me 三处都带上，前端就不必为「拿到票据」多发一次请求——
+/// 它在这些调用之后必定已经持有票据，不会出现「首屏缩略图没票」的空窗。
+fn attach_media_ticket(
+    config: &Config,
+    user_id: i64,
+    mut data: Value,
+) -> Value {
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert(
+            "media_ticket".into(),
+            json!(crypto::create_media_ticket(config, user_id, MEDIA_TICKET_TTL_SECS)),
+        );
+        obj.insert("media_ticket_ttl".into(), json!(MEDIA_TICKET_TTL_SECS));
+    }
+    data
+}
+
 /// POST /api/auth/invite/verify 校验邀请码是否可用（**不消费**）
 ///
 /// 注册页第一步调用：客户拿到码先验一次，通过了再让他填用户名密码。
@@ -81,7 +107,7 @@ pub async fn register(
 
     invite_code_service::validate_code(&pool, code).await?;
 
-    let password_hash = crypto::hash_password(&req.password)?;
+    let password_hash = crypto::hash_password_async(&req.password).await?;
 
     let user = invite_code_service::register_with_invite(
         &pool,
@@ -94,10 +120,11 @@ pub async fn register(
     let token = crypto::generate_token(user.id, &user.username, &config)?;
     Ok(Json(json!({
         "success": true,
-        "data": {
-            "token": token,
-            "user": UserInfo::from(user),
-        },
+        "data": attach_media_ticket(
+            &config,
+            user.id,
+            json!({ "token": token, "user": UserInfo::from(user) }),
+        ),
         "error": null
     })))
 }
@@ -135,7 +162,7 @@ pub async fn login(
         return Err(AppError::Unauthorized("用户名或密码错误".into()));
     };
 
-    let valid = crypto::verify_password(&req.password, &user.password_hash)?;
+    let valid = crypto::verify_password_async(&req.password, &user.password_hash).await?;
     if !valid {
         crate::utils::login_throttle::record_failure(&req.username, &ip);
         return Err(AppError::Unauthorized("用户名或密码错误".into()));
@@ -159,10 +186,11 @@ pub async fn login(
 
     Ok(Json(json!({
         "success": true,
-        "data": {
-            "token": token,
-            "user": UserInfo::from(user),
-        },
+        "data": attach_media_ticket(
+            &config,
+            user.id,
+            json!({ "token": token, "user": UserInfo::from(user) }),
+        ),
         "error": null
     })))
 }
@@ -170,6 +198,7 @@ pub async fn login(
 /// GET /api/auth/me 获取当前用户信息
 pub async fn me(
     State(pool): State<SqlitePool>,
+    State(config): State<Config>,
     auth: AuthUser,
 ) -> Result<Json<Value>, AppError> {
     let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
@@ -178,21 +207,37 @@ pub async fn me(
         .await?
         .ok_or_else(|| AppError::NotFound("用户不存在".into()))?;
 
-    // 已用容量（含回收站，与配额校验口径一致），供前端展示
-    let (used_bytes,): (i64,) =
-        sqlx::query_as("SELECT COALESCE(SUM(size), 0) FROM files WHERE owner_id = ?")
-            .bind(user.id)
-            .fetch_one(&pool)
-            .await?;
+    // 已用容量（含回收站，与配额校验口径一致），供前端展示。
+    // 统计口径见 `file_service::used_bytes`：按物理文件去重，避免批量复制翻倍。
+    let used_bytes = crate::services::file_service::used_bytes(&pool, user.id).await?;
 
-    let mut data = serde_json::to_value(UserInfo::from(user))?;
+    let mut data = serde_json::to_value(UserInfo::from(user.clone()))?;
     if let Some(obj) = data.as_object_mut() {
         obj.insert("used_bytes".into(), json!(used_bytes));
     }
 
     Ok(Json(json!({
         "success": true,
-        "data": data,
+        "data": attach_media_ticket(&config, user.id, data),
+        "error": null
+    })))
+}
+
+/// POST /api/auth/media-ticket 单独签发一枚媒体访问凭证
+///
+/// `/me` 已经会带上票据，所以这个入口是给「页面长时间开着、票据过期后
+/// 需要在不刷新用户信息的前提下补票」用的（前端 axios 请求拦截器在票据
+/// 失效时会调它）。独立成端点也让前端不必为了补票去重拉一次用户信息。
+pub async fn media_ticket(
+    State(config): State<Config>,
+    auth: AuthUser,
+) -> Result<Json<Value>, AppError> {
+    Ok(Json(json!({
+        "success": true,
+        "data": {
+            "ticket": crypto::create_media_ticket(&config, auth.user_id, MEDIA_TICKET_TTL_SECS),
+            "expires_in": MEDIA_TICKET_TTL_SECS,
+        },
         "error": null
     })))
 }

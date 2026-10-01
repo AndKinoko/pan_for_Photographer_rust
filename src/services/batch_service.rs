@@ -272,7 +272,8 @@ pub async fn batch_move(
                     };
                     if let Some((tid,)) = target_file {
                         sqlx::query(
-                            "UPDATE files SET deleted_at = datetime('now') WHERE id = ? AND owner_id = ? AND deleted_at IS NULL",
+                            "UPDATE files SET deleted_at = datetime('now'), deleted_with_folder_id = NULL
+                                WHERE id = ? AND owner_id = ? AND deleted_at IS NULL",
                         )
                         .bind(tid)
                         .bind(user_id)
@@ -537,7 +538,8 @@ pub async fn batch_copy(
                     };
                     if let Some((tid,)) = target_file {
                         sqlx::query(
-                            "UPDATE files SET deleted_at = datetime('now') WHERE id = ? AND owner_id = ? AND deleted_at IS NULL",
+                            "UPDATE files SET deleted_at = datetime('now'), deleted_with_folder_id = NULL
+                                WHERE id = ? AND owner_id = ? AND deleted_at IS NULL",
                         )
                         .bind(tid)
                         .bind(user_id)

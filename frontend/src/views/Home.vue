@@ -380,13 +380,17 @@ async function createNewFolder() {
 
 /* ----------------------------- Share ------------------------------------- */
 const showShare = ref(false)
-const shareFileIds = ref([])
-function openShare(file) {
-  shareFileIds.value = [file.id]
+/** 批次内容：`[{type:'file'|'folder', id}]`，文件与文件夹混装。 */
+const shareItems = ref([])
+function openShare(file, kind = 'file') {
+  shareItems.value = [{ type: kind, id: file.id }]
   showShare.value = true
 }
 function openBatchShare() {
-  shareFileIds.value = Array.from(selectedFiles.value)
+  shareItems.value = [
+    ...Array.from(selectedFolders.value).map((id) => ({ type: 'folder', id })),
+    ...Array.from(selectedFiles.value).map((id) => ({ type: 'file', id })),
+  ]
   showShare.value = true
 }
 async function onShareCreated() {
@@ -625,6 +629,7 @@ onMounted(() => {
             @toggle-select="toggleSelect(f, 'folder')"
             @rename="onRename(f, 'folder')"
             @remove="onRemove(f, 'folder')"
+            @share="openShare(f, 'folder')"
           />
         </div>
       </div>
@@ -645,7 +650,7 @@ onMounted(() => {
             @toggle-select="toggleSelect(f, 'file')"
             @rename="onRename(f, 'file')"
             @remove="onRemove(f, 'file')"
-            @share="openShare(f)"
+            @share="openShare(f, 'file')"
             @download="downloadFile(f)"
           />
         </div>
@@ -761,7 +766,7 @@ onMounted(() => {
 
     <ShareDialog
       v-model:visible="showShare"
-      :file-ids="shareFileIds"
+      :items="shareItems"
       @created="onShareCreated"
     />
 

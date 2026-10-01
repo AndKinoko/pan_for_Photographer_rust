@@ -56,48 +56,25 @@ pub struct BatchDeleteResult {
     pub results: Vec<BatchItemResult>,
 }
 
-/// 批量分享的请求
-#[derive(Debug, Deserialize)]
-pub struct BatchShareRequest {
-    pub file_ids: Vec<i64>,
-    pub expires_hours: Option<i64>,
-    pub password: Option<String>,
-}
-
-/// 单个分享结果
-#[derive(Debug, Serialize)]
-pub struct ShareItemResult {
-    pub file_id: i64,
-    pub file_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub share_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub share_url: Option<String>,
-    pub status: String,
-}
-
-/// 批量分享结果的摘要
-#[derive(Debug, Serialize)]
-pub struct BatchShareResult {
-    pub total: usize,
-    pub succeeded: usize,
-    pub failed: usize,
-    pub shares: Vec<ShareItemResult>,
-}
-
-/// 批量取消分享的请求
+/// 批量取消分享的请求。
+///
+/// 批次模型下一个文件可能同时出现在好几个分享里，而分享是**批次级**的——
+/// 没法只把其中一个文件从某个批次里摘掉。所以这里的语义是
+/// 「把这些项所在的分享整体停用」，前端必须在确认框里说清楚。
 #[derive(Debug, Deserialize)]
 pub struct BatchUnshareRequest {
-    pub file_ids: Vec<i64>,
+    pub items: Vec<crate::models::share::ShareItemRef>,
 }
 
-/// 单个取消分享结果
+/// 单个条目的取消分享结果
 #[derive(Debug, Serialize)]
 pub struct UnshareItemResult {
-    pub file_id: i64,
-    pub file_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub share_id: Option<String>,
+    pub id: i64,
+    pub item_type: String,
+    pub name: String,
+    /// 被停用的分享。一个条目可能牵动多个批次。
+    pub share_ids: Vec<String>,
+    /// `unshared`（至少停用了一个分享）或 `not_found`（该条目没有任何活跃分享）
     pub status: String,
 }
 

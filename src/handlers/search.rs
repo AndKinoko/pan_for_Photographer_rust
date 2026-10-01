@@ -44,6 +44,20 @@ fn default_order() -> String {
     "desc".to_string()
 }
 
+/// 转义 LIKE 的通配符。
+///
+/// 不转义的话，用户输入 `%` 会被拼成 `%%%`，匹配库里**全部**文件；输入 `_`
+/// 则变成「任意单字符」。一个搜索框输入 `%` 就把整个网盘倒出来，既反直觉，
+/// 也让返回的 `total_files` 完全失去意义。
+///
+/// 顺序要紧：`\` 必须最先替换，否则会把后面刚插入的转义符再转义一遍。
+/// 配合各 SQL 处显式声明的 `ESCAPE '\'` 使用。
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 /// 空结果的统一响应。抽出来是为了让「关键词为空」这条提前返回的分支
 /// 与正常分支的字段完全一致 —— 前端不必为它写第二套解析。
 fn empty_response() -> Json<Value> {
@@ -97,13 +111,14 @@ pub async fn search_files(
     let sort_token = format!("{}_{}", sort_field, dir.sql().to_lowercase());
     let cursor = pagination::parse_cursor(query.cursor.as_deref(), &sort_token)?;
 
-    let search_term = format!("%{}%", query.q.trim());
+    let search_term = format!("%{}%", escape_like(query.q.trim()));
 
     // WHERE 片段与绑定值**只构建一次**，COUNT 与取数共用。
     // 两边各写一遍的话，一旦只改一处，total 与 items 就会对不上，
     // 表现为「共 300 张」但翻到底只有 200 张 —— 而且不会有任何报错。
     let mut where_sql = String::from(
-        " FROM files WHERE owner_id = ? AND deleted_at IS NULL AND (name LIKE ? OR original_name LIKE ?)",
+        " FROM files WHERE owner_id = ? AND deleted_at IS NULL \
+         AND (name LIKE ? ESCAPE '\\' OR original_name LIKE ? ESCAPE '\\')",
     );
     let mut binds: Vec<Bind> = Vec::new();
 
@@ -209,7 +224,7 @@ pub async fn search_files(
             SELECT parent_id AS pid, COUNT(*) AS cnt FROM folders
             WHERE deleted_at IS NULL AND parent_id IS NOT NULL GROUP BY parent_id
         ) sc ON sc.pid = f.id
-        WHERE f.owner_id = ? AND f.deleted_at IS NULL AND f.name LIKE ?
+        WHERE f.owner_id = ? AND f.deleted_at IS NULL AND f.name LIKE ? ESCAPE '\'
         ORDER BY f.name, f.id
         "#,
     )

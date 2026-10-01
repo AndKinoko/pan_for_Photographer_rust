@@ -96,8 +96,11 @@ const emit = defineEmits([
           <AppIcon name="Copy" size="sm" />
           复制
         </button>
+        <!-- 文件夹也能进批次分享（客户点进去自己挑要下哪些），所以这里
+             不再只看 fileSelectedCount —— 原先只选文件夹时按钮根本不出现，
+             用户会以为「文件夹不能分享」。 -->
         <button
-          v-if="fileSelectedCount > 0"
+          v-if="selectedCount > 0"
           class="btn btn-sm"
           @click="emit('share')"
         >

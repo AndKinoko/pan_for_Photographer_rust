@@ -19,6 +19,49 @@ const shares = ref([])
 const loading = ref(false)
 const error = ref('')
 
+/* ---------------- 批次展示辅助 ----------------
+   列表里的每一项现在是一个**批次**（可能装着多个文件与文件夹），
+   所以缩略图、标题、副标题都要从 items 里推出来，不再有单一的 file_name。 */
+
+/** 批次缩略图取第一个「有缩略图的文件」。
+ *
+ *  注意这里走的是**登录态**的 `/api/files/:id/media`，而不是后端在
+ *  `items[].thumb_url` 里下发的公开地址——后者要走分享的密码门，
+ *  而所有者手上只有 JWT，没有那张 ticket。两套地址服务两个场景。 */
+function shareThumb(s) {
+  const it = (s.items || []).find((i) => i.item_type === 'file' && i.thumb_url)
+  return it ? `/api/files/${it.id}/media?thumb=1` : null
+}
+
+/** 条目名：只有一个时直接用它的名字，多个时给个概括。 */
+function shareTitle(s) {
+  const items = s.items || []
+  if (items.length === 0) return '(空)'
+  if (items.length === 1) return items[0].name
+  const folders = items.filter((i) => i.item_type === 'folder').length
+  const files = items.length - folders
+  const parts = []
+  if (folders) parts.push(`${folders} 个文件夹`)
+  if (files) parts.push(`${files} 个文件`)
+  return parts.join(' · ')
+}
+
+/** 副标题：递归统计——「这批交付了多少东西」比「顶层几个条目」有用。 */
+function shareSubtitle(s) {
+  const n = s.total_file_count || 0
+  const folders = s.total_folder_count || 0
+  const parts = []
+  if (folders) parts.push(`${folders} 个文件夹`)
+  parts.push(`${n} 个文件`)
+  return `${parts.join(' · ')} · ${s.formatted_size || '0 B'}`
+}
+
+function shareIcon(s) {
+  const it = (s.items || [])[0]
+  if (!it) return 'File'
+  return it.item_type === 'folder' ? 'Folder' : fileIcon(it.file_type, it.name)
+}
+
 const activeCount = computed(
   () => shares.value.filter((s) => s.is_active && !s.is_expired).length
 )
@@ -135,22 +178,22 @@ onMounted(load)
         <div class="top" @click="openShare(s)">
           <span class="thumb">
             <img
-              v-if="s.thumb_url"
-              :src="authUrl(s.thumb_url)"
+              v-if="shareThumb(s)"
+              :src="authUrl(shareThumb(s))"
               alt=""
               @error="$event.target.style.display = 'none'"
             />
             <AppIcon
               v-else
               class="file-icon"
-              :name="fileIcon(s.file_type, s.file_name)"
+              :name="shareIcon(s)"
               size="lg"
             />
           </span>
           <div class="meta">
-            <div class="name truncate" :title="s.file_name">{{ s.file_name }}</div>
+            <div class="name truncate" :title="shareTitle(s)">{{ shareTitle(s) }}</div>
             <div class="sub muted truncate">
-              {{ s.formatted_size }} · {{ s.file_type || '文件' }}
+              {{ shareSubtitle(s) }}
             </div>
             <div class="badges">
               <span v-if="s.is_expired" class="badge badge-danger">已过期</span>

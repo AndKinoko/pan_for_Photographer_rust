@@ -73,7 +73,8 @@ const hasSearched = ref(false)
 
 const preview = ref({ visible: false, index: 0 })
 const showShare = ref(false)
-const shareFileIds = ref([])
+/** 批次内容：`[{type:'file'|'folder', id}]` */
+const shareItems = ref([])
 
 let timer = null
 function scheduleSearch() {
@@ -156,8 +157,8 @@ async function onRemove(file) {
   }
 }
 
-function openShare(file) {
-  shareFileIds.value = [file.id]
+function openShare(item, kind = 'file') {
+  shareItems.value = [{ type: kind, id: item.id }]
   showShare.value = true
 }
 
@@ -280,6 +281,7 @@ function resetFilters() {
             :item="f"
             kind="folder"
             @click="onFolderClick(f)"
+            @share="openShare(f, 'folder')"
           />
         </div>
       </div>
@@ -317,7 +319,7 @@ function resetFilters() {
       @update:index="preview.index = $event"
     />
 
-    <ShareDialog v-model:visible="showShare" :file-ids="shareFileIds" />
+    <ShareDialog v-model:visible="showShare" :items="shareItems" />
   </div>
 </template>
 

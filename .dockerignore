@@ -46,8 +46,10 @@ deploy.env
 .vscode
 .idea
 
-# 作者的验证脚本（需要 /proc，Windows 上会崩）
-.p0_e2e_verify.py
+# 作者的验证脚本（需要 /proc，Windows 上会崩）。
+# 注意文件名没有前导点：.gitignore 里写的是 /p0_e2e_verify.py，
+# 这里若误写成 .p0_e2e_verify.py 规则就永远不命中，脚本会被复制进构建上下文。
+p0_e2e_verify.py
 
 # Windows
 Thumbs.db

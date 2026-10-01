@@ -1,28 +1,57 @@
 <script setup>
+/* ===========================================================================
+   公开分享页 —— 批次只读浏览器
+   ---------------------------------------------------------------------------
+   一个分享是一个**批次**：里面可以同时装多个文件与多个文件夹，文件夹可以
+   一直点进去看。客户端能做的只有两件事——**看**和**下载**。
+
+   与主文件管理页共用同一套 `FileCard`（context="share" 会裁掉重命名/分享/
+   删除，只留下载与预览），不复用的话就会长出第二套卡片，
+   然后两边的视觉与交互各自漂移。
+
+   只读的边界靠三处共同保证，缺一不可：
+     · 前端不渲染任何写入入口（本文件里根本没有上传/新建/重命名/删除的代码）
+     · 后端对每个 file_id / folder_id 做子树授权（share_service::file_in_share）
+     · 服务端只暴露 /api/public/* 的只读接口给未登录请求
+   =========================================================================== */
+
 import { ref, computed, onMounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   getPublicShare,
+  getPublicShareItems,
   verifySharePassword,
-  publicShareDownloadUrl,
-  fileIcon,
-  formatSize,
+  withShareTicket,
   formatDate,
 } from '../api'
 import { useToast } from '../composables/useToast'
 import AppIcon from '../components/AppIcon.vue'
 import PasswordInput from '../components/PasswordInput.vue'
+import FileCard from '../components/FileCard.vue'
+import FilePreview from '../components/FilePreview.vue'
+import LoadMore from '../components/LoadMore.vue'
 import { useTheme } from '../composables/useTheme'
 import { useTransfer } from '../composables/useTransfer'
 
 const route = useRoute()
 const toast = useToast()
 const { theme, toggle: toggleTheme } = useTheme()
-const transfer = useTransfer()
+// 顶层解构，模板里才能自动解包 ref
+const { enqueueDownload, downloadActiveCount } = useTransfer()
+
+/**
+ * 一次最多入队多少个下载。
+ *
+ * 不打包 zip，所以「下载所选」是**并发发起 N 个下载**。浏览器对同时多个
+ * 下载有弹窗拦截，而下载实现是先把整个文件读进内存再落盘——选 20 张大图
+ * 已经能把标签页压得很紧。超过就明确告诉用户分批，而不是让他点完卡死。
+ */
+const MAX_BATCH_DOWNLOAD = 20
 
 const share = ref(null)
 const loading = ref(true)
 const loadError = ref('')
+
 const needsPassword = ref(false)
 const password = ref('')
 const pwdError = ref('')
@@ -33,63 +62,45 @@ const ticket = ref('')
 
 const id = computed(() => route.params.id)
 
-const isImage = computed(() => {
-  if (!share.value) return false
-  const ext = share.value.file_type?.toLowerCase()
-  const imageExts = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'tiff', 'tif', 'svg', 'avif']
-  const rawExts = ['nef', 'cr2', 'cr3', 'crw', 'arw', 'sr2', 'srf', 'dng', 'raf', 'orf', 'rw2', 'nrw']
-  return imageExts.includes(ext) || rawExts.includes(ext)
-})
-const isVideo = computed(() =>
-  ['mp4', 'webm', 'mov', 'ogg', 'mkv'].includes(share.value?.file_type?.toLowerCase())
+/* ---------------- 浏览状态 ---------------- */
+
+/** 当前所在目录；`null` = 批次根（列出批次里直接包含的条目） */
+const folderId = ref(null)
+const breadcrumbs = ref([])
+const items = ref([])
+const total = ref(0)
+const hasMore = ref(false)
+const nextCursor = ref(null)
+const browsing = ref(false)
+const browseError = ref('')
+
+const selected = ref(new Set())
+const preview = ref({ visible: false, list: [], index: 0 })
+
+const keyOf = (it) => `${it.item_type}:${it.id}`
+const isFolder = (it) => it.item_type === 'folder'
+
+const selectedCount = computed(() => selected.value.size)
+const selectedFiles = computed(() =>
+  items.value.filter((i) => !isFolder(i) && selected.value.has(keyOf(i)))
 )
-const isAudio = computed(() =>
-  ['mp3', 'wav', 'flac', 'ogg', 'aac', 'm4a'].includes(share.value?.file_type?.toLowerCase())
+const allSelected = computed(
+  () =>
+    items.value.filter((i) => !isFolder(i)).length > 0 &&
+    items.value.filter((i) => !isFolder(i)).every((i) => selected.value.has(keyOf(i)))
 )
-const isPdf = computed(() => share.value?.file_type?.toLowerCase() === 'pdf')
-const isFolder = computed(() => share.value?.file_type === 'folder')
 
-function downloadShared() {
-  // 纵深防御：即使按钮因模板调整意外可见，未过密码校验也不放行。
-  if (needsPassword.value && !verified.value) {
-    toast.error('请先输入访问密码')
-    return
-  }
-  if (!share.value) return
-  // 下载进入全局下载队列（公开分享使用访问凭证，无用户 token）
-  transfer.enqueueDownload({
-    filename: share.value.file_name,
-    url: publicShareDownloadUrl(share.value.id, ticket.value),
-    authed: false,
-  })
-}
+/* ---------------- 加载 ---------------- */
 
-const canShowMedia = computed(() => {
-  if (!share.value) return false
-  if (isFolder.value) return false
-  // 显式排除「有密码但未验证」，而不是依赖模板的 v-else-if 分支顺序。
-  //
-  // 安全性此前完全靠 <template> 里 `v-else-if="needsPassword"` 恰好排在
-  // 媒体区之前：一旦有人调整分支顺序、或 needsPassword 因某种原因没被置位
-  // （例如后端漏返 has_password），密码门的媒体区就会直接裸奔。
-  // 把判断收敛到计算属性里，改模板顺序不会再影响安全性。
-  if (needsPassword.value && !verified.value) return false
-  return (
-    isImage.value || isVideo.value || isAudio.value || isPdf.value
-  )
-})
-
-/** 同理收紧下载入口：未通过密码校验时不给下载按钮。 */
-const canDownload = computed(() => !!share.value && !isFolder.value)
-
-async function load() {
+async function loadShare() {
   loading.value = true
   loadError.value = ''
   try {
-    share.value = await getPublicShare(id.value)
-    // 后端一定会返回 has_password；这里对「字段缺失」也保守处理成
-    // 「需要密码」——宁可多问一次口令，也不能因为后端改了字段名就静默
-    // 放行。verified 为真时（刷新后重验通过）不受影响。
+    // 带上访问凭证：受密码保护的分享，只有带了有效 ticket，后端才会下发
+    // 媒体地址。verify() 通过后会重新调用本函数，此时 ticket 已就位。
+    share.value = await getPublicShare(id.value, ticket.value)
+    // 后端一定会返回 has_password；对「字段缺失」也保守处理成「需要密码」——
+    // 宁可多问一次口令，也不能因为后端改了字段名就静默放行。
     if (!verified.value) {
       const pwdFlag = share.value?.has_password
       needsPassword.value = pwdFlag === undefined ? true : !!pwdFlag
@@ -101,7 +112,50 @@ async function load() {
   }
 }
 
-/** 把错误同时放到字段旁边（可读、可复制、不会 3 秒后消失）并聚焦回输入框 */
+/** 列出某个目录的内容。`target = null` 表示回到批次根。 */
+async function browse(target = null, { append = false } = {}) {
+  browsing.value = true
+  browseError.value = ''
+  try {
+    const page = await getPublicShareItems(id.value, {
+      folderId: target,
+      ticket: ticket.value,
+      cursor: append ? nextCursor.value : null,
+    })
+    folderId.value = page.folderId
+    breadcrumbs.value = page.breadcrumbs
+    items.value = append ? items.value.concat(page.items) : page.items
+    total.value = page.total
+    hasMore.value = page.hasMore
+    nextCursor.value = page.nextCursor
+  } catch (e) {
+    if (!append) {
+      items.value = []
+      breadcrumbs.value = []
+    }
+    browseError.value = e.message || '加载失败'
+  } finally {
+    browsing.value = false
+  }
+}
+
+function enterFolder(item) {
+  if (!isFolder(item)) return
+  selected.value = new Set()
+  browse(item.id)
+}
+
+function enterRoot() {
+  selected.value = new Set()
+  browse(null)
+}
+
+function loadMore() {
+  if (hasMore.value && !browsing.value) browse(folderId.value, { append: true })
+}
+
+/* ---------------- 密码门 ---------------- */
+
 async function failVerify(msg) {
   pwdError.value = msg
   await nextTick()
@@ -114,28 +168,19 @@ async function verify() {
   verifying.value = true
   try {
     const data = await verifySharePassword(id.value, password.value)
-    // 后端签发与本次分享绑定的短时效访问凭证，媒体与下载请求需携带它
     ticket.value = data?.ticket || ''
     verified.value = true
     needsPassword.value = false
-    // 后端对**有密码的分享**不下发 preview_url / thumb_url（少给一个能被
-    // 利用的环节），所以验码后必须重新拉一次详情才能拿到媒体地址。
-    // 不重新拉的话，验完口令仍然看不到预览。
-    await load()
+    // 后端对**有密码的分享**在未解锁时不下发媒体地址，所以验码后必须重新
+    // 拉一次详情与内容。不重新拉的话，验完口令仍然看不到任何东西。
+    await loadShare()
+    await browse(null)
     toast.success('密码正确')
   } catch (e) {
-    // 原先只弹 toast——3 秒后消失，且不在字段旁，读屏用户也接不到
     failVerify(e.message || '密码错误')
   } finally {
     verifying.value = false
   }
-}
-
-/** 给媒体/缩略图 URL 追加访问凭证（受密码保护时）。 */
-function withTicket(url) {
-  if (!url || !ticket.value) return url
-  const sep = url.includes('?') ? '&' : '?'
-  return `${url}${sep}ticket=${encodeURIComponent(ticket.value)}`
 }
 
 function onKeydown(e) {
@@ -145,7 +190,102 @@ function onKeydown(e) {
   verify()
 }
 
-onMounted(load)
+/* ---------------- 选择与下载 ---------------- */
+
+function toggleSelect(item) {
+  if (isFolder(item)) return
+  const next = new Set(selected.value)
+  const k = keyOf(item)
+  if (next.has(k)) next.delete(k)
+  else next.add(k)
+  selected.value = next
+}
+
+function toggleSelectAll() {
+  if (allSelected.value) {
+    selected.value = new Set()
+  } else {
+    selected.value = new Set(items.value.filter((i) => !isFolder(i)).map(keyOf))
+  }
+}
+
+function enqueue(item) {
+  enqueueDownload({
+    filename: item.name,
+    // 公开分享没有登录态，凭据只能走查询串（后端对每个 file_id 做子树校验）
+    url: withShareTicket(item.download_url, ticket.value),
+    authed: false,
+  })
+}
+
+function downloadOne(item) {
+  if (isFolder(item)) return
+  enqueue(item)
+}
+
+function downloadSelected() {
+  const files = selectedFiles.value
+  if (files.length === 0) {
+    toast.warning('请先选择要下载的文件')
+    return
+  }
+  if (files.length > MAX_BATCH_DOWNLOAD) {
+    toast.warning(
+      `一次最多下载 ${MAX_BATCH_DOWNLOAD} 个文件，当前选了 ${files.length} 个，请分批下载`
+    )
+    return
+  }
+  for (const f of files) enqueue(f)
+  toast.success(`已加入下载队列：${files.length} 个文件`)
+  selected.value = new Set()
+}
+
+/* ---------------- 预览 ---------------- */
+
+/** FilePreview 需要 `media_url`（GIF 播原图用），而批次条目里后端只给了
+ *  预览地址与下载地址。这里按同一套公开接口补一个「原文件」地址。 */
+function toPreviewEntry(item) {
+  return {
+    ...item,
+    media_url: `/api/public/shares/${id.value}/media?file_id=${item.id}`,
+  }
+}
+
+function previewOne(item) {
+  if (isFolder(item)) return
+  const playable = items.value.filter((i) => !isFolder(i) && isPreviewableItem(i))
+  const idx = playable.findIndex((i) => i.id === item.id)
+  if (idx < 0) return
+  preview.value = { visible: true, list: playable.map(toPreviewEntry), index: idx }
+}
+
+function isPreviewableItem(item) {
+  const ext = (item.name || '').split('.').pop()?.toLowerCase() || ''
+  return [
+    'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'tiff', 'tif', 'avif', 'heic',
+    'nef', 'cr2', 'cr3', 'crw', 'arw', 'sr2', 'srf', 'dng', 'raf', 'orf', 'rw2', 'nrw',
+    'mp4', 'mov', 'avi', 'mkv', 'webm', 'm4v',
+    'mp3', 'wav', 'flac', 'ogg', 'aac', 'm4a',
+    'pdf',
+  ].includes(ext)
+}
+
+function onItemClick(item) {
+  if (isFolder(item)) {
+    enterFolder(item)
+    return
+  }
+  if (isPreviewableItem(item)) previewOne(item)
+  else downloadOne(item)
+}
+
+onMounted(async () => {
+  await loadShare()
+  // 未解锁时不预取内容——后端会 401，白跑一趟还多一条报错
+  if (!needsPassword.value && !loadError.value) {
+    await browse(null)
+  }
+})
 </script>
 
 <template>
@@ -205,9 +345,6 @@ onMounted(load)
           {{ verifying ? '验证中…' : '验证' }}
         </button>
       </div>
-      <!-- 原为 autocomplete="current-password"：会让密码管理器把用户自己的
-           站点密码填进「分享访问密码」，两者是不同的凭据。
-           这里是一次性凭证，用 off 更准确。 -->
       <p v-if="pwdError" id="share-password-error" class="err" role="alert">
         {{ pwdError }}
       </p>
@@ -215,83 +352,114 @@ onMounted(load)
 
     <!-- Content -->
     <div v-else class="card content-card">
-      <div class="file-head">
-        <span class="thumb">
-          <img
-            v-if="isImage && share.thumb_url"
-            :src="withTicket(share.thumb_url)"
-            alt=""
-            @error="$event.target.style.display = 'none'"
-          />
-          <AppIcon
-            v-else
-            class="file-icon"
-            :name="isFolder ? 'Folder' : fileIcon(share.file_type, share.file_name)"
-            size="lg"
-          />
-        </span>
-        <div class="file-meta">
-          <h1 class="file-name truncate" :title="share.file_name">
-            {{ share.file_name }}
-          </h1>
-          <div class="meta-row muted">
-            <span v-if="!isFolder">{{ share.formatted_size || formatSize(share.file_size) }}</span>
-            <span v-if="!isFolder" class="dot">·</span>
-            <span>{{ share.owner_name }} 分享</span>
-            <span class="dot">·</span>
-            <span>{{ share.download_count }} 次下载</span>
-          </div>
-          <div class="meta-row muted">
-            <span v-if="share.expires_at">到期：{{ formatDate(share.expires_at) }}</span>
-            <span v-else>永久有效</span>
-            <span v-if="share.max_downloads" class="dot">·</span>
-            <span v-if="share.max_downloads">最多 {{ share.max_downloads }} 次</span>
-          </div>
+      <header class="batch-head">
+        <h1 class="batch-title">{{ share.owner_name }} 分享的内容</h1>
+        <div class="meta-row muted">
+          <span v-if="share.total_folder_count">{{ share.total_folder_count }} 个文件夹</span>
+          <span v-if="share.total_folder_count" class="dot">·</span>
+          <span>{{ share.total_file_count }} 个文件</span>
+          <span class="dot">·</span>
+          <span>{{ share.formatted_size }}</span>
         </div>
-      </div>
+        <div class="meta-row muted">
+          <span class="badge-readonly">
+            <AppIcon name="Lock" size="sm" /> 只读
+          </span>
+          <span v-if="share.expires_at">到期：{{ formatDate(share.expires_at) }}</span>
+          <span v-else>永久有效</span>
+          <span v-if="share.max_downloads" class="dot">·</span>
+          <span v-if="share.max_downloads">
+            最多下载 {{ share.max_downloads }} 个文件（已用 {{ share.download_count }}）
+          </span>
+        </div>
+      </header>
 
-      <div v-if="canShowMedia && share.preview_url" class="media">
-        <img
-          v-if="isImage"
-          :src="withTicket(share.preview_url)"
-          :alt="share.file_name"
-        />
-        <video v-else-if="isVideo" :src="withTicket(share.preview_url)" controls />
-        <audio v-else-if="isAudio" :src="withTicket(share.preview_url)" controls />
-        <iframe
-          v-else-if="isPdf"
-          :src="withTicket(share.preview_url)"
-          class="pdf"
-          title="PDF 预览"
-          sandbox="allow-same-origin allow-downloads"
-        />
-      </div>
-
-      <div v-else-if="isFolder" class="folder-note state">
-        <AppIcon class="state-icon" name="FolderOpen" size="xl" />
-        <p>这是一个文件夹分享</p>
-      </div>
-
-      <div v-else class="fallback state">
-        <AppIcon
-          class="state-icon"
-          :name="fileIcon(share.file_type, share.file_name)"
-          size="xl"
-        />
-        <p>该文件类型暂不支持在线预览</p>
-      </div>
-
-      <div class="actions">
-        <button
-          v-if="canDownload && !(needsPassword && !verified)"
-          class="btn btn-primary download"
-          @click="downloadShared"
-        >
-          <AppIcon name="Download" size="sm" /> 下载文件
+      <!-- 进入子目录后的返回路径。只在扎根时显示第一条。 -->
+      <nav v-if="folderId !== null" class="nav" aria-label="目录导航">
+        <button class="crumb" @click="enterRoot">
+          <AppIcon name="FolderOpen" size="sm" /> 全部内容
         </button>
-        <span v-else class="muted">文件夹暂不支持打包下载</span>
+        <template v-for="(c, i) in breadcrumbs" :key="c.id">
+          <AppIcon class="sep" name="ChevronRight" size="sm" />
+          <button
+            class="crumb"
+            :class="{ current: i === breadcrumbs.length - 1 }"
+            @click="browse(c.id)"
+          >
+            {{ c.name }}
+          </button>
+        </template>
+      </nav>
+
+      <div v-if="browseError" class="state err-state">
+        <AppIcon class="state-icon" name="CircleAlert" size="xl" />
+        <p>{{ browseError }}</p>
       </div>
+
+      <div v-else-if="browsing && items.length === 0" class="state">
+        <div class="spinner" />
+      </div>
+
+      <div v-else-if="items.length === 0" class="state">
+        <AppIcon class="state-icon" name="FolderOpen" size="xl" />
+        <p>这里没有内容</p>
+      </div>
+
+      <!-- 与主文件管理页**同一个卡片组件**，靠 context 裁掉写操作 -->
+      <div v-else class="grid">
+        <FileCard
+          v-for="it in items"
+          :key="keyOf(it)"
+          :item="it"
+          :kind="isFolder(it) ? 'folder' : 'file'"
+          context="share"
+          :ticket="ticket"
+          :selected="selected.has(keyOf(it))"
+          :selectable="!isFolder(it)"
+          @click="onItemClick(it)"
+          @toggle-select="toggleSelect(it)"
+          @download="downloadOne(it)"
+          @preview="previewOne(it)"
+        />
+      </div>
+
+      <LoadMore
+        v-if="hasMore"
+        :has-more="hasMore"
+        :loaded="items.length"
+        :total="total"
+        :loading="browsing"
+        @more="loadMore"
+      />
     </div>
+
+    <!-- 批量条：公开页只有「下载」一个动作，所以没有复用 BatchToolbar -->
+    <div v-if="selectedCount" class="sel-bar">
+      <span class="sel-count">已选 {{ selectedCount }} 项</span>
+      <button class="btn btn-ghost" @click="toggleSelectAll">
+        {{ allSelected ? '取消全选' : '全选本页' }}
+      </button>
+      <button class="btn btn-ghost" @click="selected = new Set()">清空</button>
+      <button class="btn btn-primary" @click="downloadSelected">
+        <AppIcon name="Download" size="sm" /> 下载所选
+      </button>
+    </div>
+
+    <!-- 下载进度：公开页没有全局传输抽屉，进度必须就地反馈 -->
+    <div v-if="downloadActiveCount > 0" class="dl-status" role="status">
+      <div class="spinner spinner-sm" />
+      正在下载 {{ downloadActiveCount }} 个文件…
+    </div>
+
+    <FilePreview
+      v-model:visible="preview.visible"
+      mode="share"
+      :ticket="ticket"
+      :files="preview.list"
+      :index="preview.index"
+      @close="preview.visible = false"
+      @update:index="preview.index = $event"
+    />
   </div>
 </template>
 
@@ -301,7 +469,7 @@ onMounted(load)
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 32px 16px 64px;
+  padding: 32px 16px 96px;
   background: radial-gradient(
       circle at 50% 0%,
       var(--primary-soft),
@@ -333,7 +501,7 @@ onMounted(load)
   font-size: 1.6rem;
 }
 .card {
-  width: min(94vw, 720px);
+  width: min(94vw, 1100px);
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -346,6 +514,7 @@ onMounted(load)
   flex-direction: column;
   align-items: center;
   gap: 12px;
+  max-width: 480px;
 }
 .center-card .center-icon {
   color: var(--text-muted);
@@ -367,37 +536,12 @@ onMounted(load)
 .content-card {
   padding: 20px;
 }
-.file-head {
-  display: flex;
-  gap: 14px;
-  align-items: center;
+.batch-head {
   margin-bottom: 16px;
 }
-.thumb {
-  width: 64px;
-  height: 64px;
-  flex: 0 0 64px;
-  border-radius: var(--radius);
-  background: var(--bg-hover);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  overflow: hidden;
-}
-.thumb img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-.thumb .file-icon {
-  color: var(--text-muted);
-}
-.file-meta {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-.file-name {
+.batch-title {
   font-size: 1.15rem;
+  margin-bottom: 4px;
 }
 .meta-row {
   font-size: 0.82rem;
@@ -410,50 +554,123 @@ onMounted(load)
 .dot {
   opacity: 0.5;
 }
-.media {
-  background: var(--bg);
-  border-radius: var(--radius);
-  overflow: hidden;
+.badge-readonly {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--bg-hover);
+  color: var(--text-muted);
+  font-size: 0.76rem;
+}
+
+.nav {
   display: flex;
   align-items: center;
-  justify-content: center;
-  margin-bottom: 16px;
+  gap: 4px;
+  flex-wrap: wrap;
+  padding-bottom: 12px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--border);
 }
-.media img {
-  max-width: 100%;
-  max-height: 70vh;
-  display: block;
+.crumb {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  color: var(--text-body);
+  font-size: 0.86rem;
 }
-.media video {
-  width: 100%;
-  max-height: 70vh;
+.crumb:hover {
+  background: var(--bg-hover);
+  color: var(--text-heading);
 }
-.pdf {
-  width: 100%;
-  height: 70vh;
-  border: none;
-  border-radius: var(--radius);
-  background: #fff;
+.crumb.current {
+  color: var(--text-heading);
+  font-weight: 600;
 }
-.fallback {
+.sep {
+  color: var(--text-muted);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 16px;
+}
+.state {
   padding: 48px 24px;
-}
-.folder-note {
-  padding: 40px 24px;
-}
-.actions {
+  text-align: center;
+  color: var(--text-muted);
   display: flex;
-  justify-content: center;
+  flex-direction: column;
+  align-items: center;
   gap: 12px;
-  margin-top: 8px;
 }
-.download {
-  min-width: 200px;
+.state-icon {
+  color: var(--text-muted);
 }
-/* .state .state-icon 的样式由 style.css 统一提供 */
+.err-state {
+  color: var(--danger);
+}
+
+.sel-bar {
+  position: fixed;
+  left: 50%;
+  bottom: 20px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-lg);
+  z-index: var(--z-popover);
+}
+.sel-count {
+  font-size: 0.86rem;
+  color: var(--text-body);
+  white-space: nowrap;
+}
+
+.dl-status {
+  position: fixed;
+  right: 16px;
+  bottom: 20px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  font-size: 0.84rem;
+  color: var(--text-body);
+  z-index: var(--z-popover);
+}
+.spinner-sm {
+  width: 14px;
+  height: 14px;
+  border-width: 2px;
+}
+
 @media (max-width: 600px) {
   .pwd-form {
     flex-direction: column;
+  }
+  .grid {
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 12px;
+  }
+  .sel-bar {
+    width: calc(100vw - 24px);
+    flex-wrap: wrap;
+    justify-content: center;
   }
 }
 </style>

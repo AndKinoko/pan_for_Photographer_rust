@@ -8,6 +8,7 @@ import {
   formatSize,
   formatDate,
   isImageFile,
+  withShareTicket,
 } from '../api'
 
 const props = defineProps({
@@ -15,7 +16,19 @@ const props = defineProps({
   kind: { type: String, default: 'file' }, // 'file' | 'folder'
   selected: { type: Boolean, default: false },
   selectable: { type: Boolean, default: false },
-  context: { type: String, default: 'browse' }, // 'browse' | 'trash'
+  /**
+   * 卡片所处的场景。**同一个组件服务所有场景**，靠这个开关裁剪能力——
+   * 而不是各自复制一份卡片（本项目已经有过「四套对话框各写各的」的教训，
+   * 复制出来的几份会各自演化，最后没有一处是对的）。
+   *
+   *   browse —— 主文件管理页：重命名 / 分享 / 删除
+   *   trash  —— 回收站：恢复 / 永久删除
+   *   share  —— 公开分享页（客户侧，**只读**）：只有下载与预览，
+   *             文件夹连 ⋯ 菜单都不渲染（没有任何可做的操作）
+   */
+  context: { type: String, default: 'browse' },
+  /** context 为 share 时，用来给媒体地址补上访问凭证 */
+  ticket: { type: String, default: '' },
 })
 
 const emit = defineEmits([
@@ -25,9 +38,24 @@ const emit = defineEmits([
   'remove',
   'share',
   'download',
+  'preview',
   'restore',
   'permanent',
 ])
+
+const isShareContext = computed(() => props.context === 'share')
+
+/**
+ * 媒体地址的凭证处理在两个场景下不同：
+ *   登录态 → 追加 media ticket（见 api.js 的 authUrl）
+ *   公开分享页 → 追加该分享的访问票据
+ * 收在一处，模板里就只有一个 `mediaUrl(...)`，不会出现「有一处忘了加票据、
+ * 缩略图在受密码保护的分享里全裂」这种只在特定条件下暴露的问题。
+ */
+function mediaUrl(url) {
+  if (!url) return url
+  return isShareContext.value ? withShareTicket(url, props.ticket) : authUrl(url)
+}
 
 // ⋯ 菜单的浮层定位与全局监听都在这里——菜单装不进卡片，必须 Teleport 出去，
 // 所以它需要自己的坐标计算与滚动关闭策略。详见 useCardMenu.js 的说明。
@@ -102,7 +130,7 @@ function run(action, e) {
     @keydown.enter.prevent="onCardClick"
   >
     <label
-      v-if="context === 'browse'"
+      v-if="context !== 'trash' && !(isShareContext && isFolder)"
       class="checkbox"
       :class="{ visible: selectable || selected }"
       :title="selected ? '取消选择' : '选择'"
@@ -114,7 +142,7 @@ function run(action, e) {
     <div class="thumb">
       <img
         v-if="isImg && thumbUrl"
-        :src="authUrl(thumbUrl)"
+        :src="mediaUrl(thumbUrl)"
         loading="lazy"
         alt=""
         @error="$event.target.style.display = 'none'"
@@ -137,6 +165,7 @@ function run(action, e) {
 
     <div class="menu-wrap">
       <button
+        v-if="!(isShareContext && isFolder)"
         ref="anchorEl"
         class="menu-btn"
         :class="{ open: menuOpen }"
@@ -166,19 +195,33 @@ function run(action, e) {
               <button role="menuitem" @click="run('rename', $event)">
                 <AppIcon name="Pencil" size="sm" /> 重命名
               </button>
-              <button v-if="!isFolder" role="menuitem" @click="run('share', $event)">
+              <!-- 分享对文件和文件夹都开放：一个分享是一个**批次**，里面
+                   可以装文件夹（客户点进去自己挑要下哪些）。
+                   这里原先写的是 `v-if="!isFolder"`，是「一个分享只能指向
+                   一个文件」那个旧模型的残留——当时分享文件夹确实做不到。 -->
+              <button role="menuitem" @click="run('share', $event)">
                 <AppIcon name="Link" size="sm" /> 分享
               </button>
               <button class="danger" role="menuitem" @click="run('remove', $event)">
                 <AppIcon name="Trash2" size="sm" /> 删除
               </button>
             </template>
-            <template v-else>
+            <template v-else-if="context === 'trash'">
               <button role="menuitem" @click="run('restore', $event)">
                 <AppIcon name="RotateCcw" size="sm" /> 恢复
               </button>
               <button class="danger" role="menuitem" @click="run('permanent', $event)">
                 <AppIcon name="Trash2" size="sm" /> 永久删除
+              </button>
+            </template>
+            <!-- 分享页：只读。文件夹连 ⋯ 都不渲染（上面的 v-if 已经挡掉），
+                 文件留下载与预览两项——这是客户在这页唯二能做的事。 -->
+            <template v-else>
+              <button role="menuitem" @click="run('preview', $event)">
+                <AppIcon name="Eye" size="sm" /> 预览
+              </button>
+              <button role="menuitem" @click="run('download', $event)">
+                <AppIcon name="Download" size="sm" /> 下载
               </button>
             </template>
           </div>

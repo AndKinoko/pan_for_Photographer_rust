@@ -58,6 +58,16 @@ async fn fixture(name: &str) -> Fixture {
     let upload_dir = dir.join("uploads");
     std::fs::create_dir_all(&upload_dir).expect("创建测试上传目录失败");
 
+    // 静态目录也放进临时目录：SPA 回退的行为依赖 index.html 是否存在，
+    // 若指向仓库里真实构建出来的 static/（gitignore 产物、CI 上不存在），
+    // 相关断言就会随环境漂移。
+    let static_dir = dir.join("static");
+    std::fs::create_dir_all(static_dir.join("assets")).expect("创建测试静态目录失败");
+    std::fs::write(static_dir.join("index.html"), SPA_INDEX_HTML).expect("写入测试 index.html 失败");
+    std::fs::write(static_dir.join("assets").join("app.js"), "console.log('asset')
+")
+        .expect("写入测试静态资源失败");
+
     let db_path = dir.join("test.db");
     let database_url = format!("sqlite:{}?mode=rwc", db_path.display());
     let pool = crate::db::init_db(&database_url)
@@ -69,7 +79,7 @@ async fn fixture(name: &str) -> Fixture {
         server_port: 0,
         database_url,
         upload_dir,
-        static_dir: "static".into(),
+        static_dir: static_dir.to_string_lossy().into_owned(),
         jwt_secret: b"0123456789abcdef0123456789abcdef".to_vec(),
         max_file_size: 1024 * 1024,
         gc_interval_sec: 0,
@@ -77,6 +87,10 @@ async fn fixture(name: &str) -> Fixture {
 
     Fixture { pool, config, dir }
 }
+
+/// 测试用 index.html。带一个可辨识的标记串，便于断言「回退确实吐的是它」。
+const SPA_INDEX_HTML: &str = "<!doctype html><html><body><div id=\"SPA-MARKER\"></div></body></html>
+";
 
 fn router(f: &Fixture) -> axum::Router {
     build_router(AppState {
@@ -501,6 +515,13 @@ async fn json_body(res: axum::response::Response) -> serde_json::Value {
         .await
         .expect("读取响应体失败");
     serde_json::from_slice(&bytes).expect("响应不是合法 JSON")
+}
+
+async fn body_text(res: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .expect("读取响应体失败");
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// 按游标翻完一个列表接口，返回 `(按顺序的 id 序列, 页数, 接口报告的总数)`。
@@ -957,20 +978,29 @@ async fn expire_user(f: &Fixture, user_id: i64) {
 }
 
 // ---------------------------------------------------------------------------
-// 缺陷 1：?token= 绕过账号有效期
+// 媒体访问凭证：?ticket=<media ticket> 旁路
 // ---------------------------------------------------------------------------
+//
+// 缩略图 <img> 与下载 <a download> 带不了 Authorization 头，所以凭据只能走
+// 查询串。原先走的是 **JWT 本身** —— 7 天有效期的全权限凭据被写进每一次
+// 缩略图 URL，而查询串会被 Cloudflare 边缘日志、浏览器历史完整记录。
+// 现在换成窄口径、2 小时有效的 media ticket。
+//
+// 下面这几条锁的是换过之后必须同时成立的四件事：有效期仍要拦、正常用户仍要
+// 能用、JWT 不再能从查询串进来、票据不反向升格成 bearer token。
 
-/// 已过期账号的令牌，通过查询参数旁路仍能下载文件 —— 修复前成立。
+/// 已过期账号的媒体票据，走查询参数旁路仍必须被拒。
 ///
 /// 旁路存在的理由是 `<img src>` 与下载链接无法带 Authorization 头。
-/// 但「验签通过」只说明令牌是我们签的、没过 7 天，说明不了签发者现在还有权限。
+/// 但「验签通过」只说明票据是我们签的、没过 2 小时，说明不了签发者现在还有权限。
 #[tokio::test]
-async fn query_token_cannot_bypass_account_expiry() {
-    let f = fixture("sec_token_expiry").await;
-    let (uid, token) = add_user(&f, "expired_user").await;
+async fn media_ticket_cannot_bypass_account_expiry() {
+    let f = fixture("sec_ticket_expiry").await;
+    let (uid, _token) = add_user(&f, "expired_user").await;
     let (file_id, _) = add_file(&f, uid, "secret.jpg", b"private").await;
+    let ticket = crypto::create_media_ticket(&f.config, uid, 3600);
 
-    // 令牌此刻仍然有效（未过期、未篡改）
+    // 票据此刻仍然有效（未过期、未篡改）
     let before = router(&f)
         .oneshot(
             Request::builder()
@@ -982,12 +1012,12 @@ async fn query_token_cannot_bypass_account_expiry() {
         .unwrap();
     assert_eq!(before.status(), StatusCode::UNAUTHORIZED, "无凭据应被拒");
 
-    // 账号过期后，同一个令牌从旁路也应失效
+    // 账号过期后，同一枚票据从旁路也应失效
     expire_user(&f, uid).await;
     let res = router(&f)
         .oneshot(
             Request::builder()
-                .uri(format!("/api/files/{}/download?token={}", file_id, token))
+                .uri(format!("/api/files/{}/download?ticket={}", file_id, ticket))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -996,14 +1026,14 @@ async fn query_token_cannot_bypass_account_expiry() {
     assert_eq!(
         res.status(),
         StatusCode::UNAUTHORIZED,
-        "已过期账号的令牌不得通过 ?token= 继续下载"
+        "已过期账号的票据不得继续下载"
     );
 
     // 媒体接口同理（缩略图 URL 同样走这条旁路）
     let res = router(&f)
         .oneshot(
             Request::builder()
-                .uri(format!("/api/files/{}/media?token={}", file_id, token))
+                .uri(format!("/api/files/{}/media?ticket={}", file_id, ticket))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1012,7 +1042,7 @@ async fn query_token_cannot_bypass_account_expiry() {
     assert_eq!(
         res.status(),
         StatusCode::UNAUTHORIZED,
-        "已过期账号的令牌不得通过 ?token= 读取媒体"
+        "已过期账号的票据不得继续读取媒体"
     );
 
     f.cleanup().await;
@@ -1020,21 +1050,107 @@ async fn query_token_cannot_bypass_account_expiry() {
 
 /// 未过期账号不受影响 —— 防止修复过头把正常用户也挡在门外。
 #[tokio::test]
-async fn query_token_still_works_for_active_account() {
-    let f = fixture("sec_token_ok").await;
-    let (uid, token) = add_user(&f, "active_user").await;
+async fn media_ticket_works_for_active_account() {
+    let f = fixture("sec_ticket_ok").await;
+    let (uid, _token) = add_user(&f, "active_user").await;
     let (file_id, _) = add_file(&f, uid, "ok.jpg", b"hello").await;
+    let ticket = crypto::create_media_ticket(&f.config, uid, 3600);
 
     let res = router(&f)
         .oneshot(
             Request::builder()
-                .uri(format!("/api/files/{}/download?token={}", file_id, token))
+                .uri(format!("/api/files/{}/download?ticket={}", file_id, ticket))
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK, "有效账号必须仍能走旁路下载");
+
+    f.cleanup().await;
+}
+
+/// **JWT 不再能从查询串进来。**
+///
+/// 这是整个替换的意义所在：只要旧入口还留着，泄漏路径就没有真正关掉 ——
+/// 前端改了，书签、历史记录里那些 `?token=<7天JWT>` 的旧 URL 照样有效。
+#[tokio::test]
+async fn jwt_is_not_accepted_in_the_query_string() {
+    let f = fixture("sec_no_jwt_in_query").await;
+    let (uid, token) = add_user(&f, "jwt_user").await;
+    let (file_id, _) = add_file(&f, uid, "ok.jpg", b"hello").await;
+
+    for uri in [
+        format!("/api/files/{}/download?token={}", file_id, token),
+        format!("/api/files/{}/media?token={}", file_id, token),
+    ] {
+        let res = router(&f)
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "JWT 不应再被查询串接受（{uri}）—— 否则旧 URL 会一直有效"
+        );
+    }
+
+    f.cleanup().await;
+}
+
+/// 媒体票据不能反过来当 bearer token 用：它只对媒体/下载接口有效。
+#[tokio::test]
+async fn media_ticket_cannot_be_used_as_a_bearer_token() {
+    let f = fixture("sec_ticket_scope").await;
+    let (uid, _token) = add_user(&f, "scope_user").await;
+    let ticket = crypto::create_media_ticket(&f.config, uid, 3600);
+
+    let res = router(&f)
+        .oneshot(
+            Request::builder()
+                .uri("/api/files")
+                .header(header::AUTHORIZATION, format!("Bearer {}", ticket))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::UNAUTHORIZED,
+        "媒体票据拿去当 JWT 用必须失败 —— 它的价值就在于口径窄"
+    );
+
+    f.cleanup().await;
+}
+
+/// 票据只对签发给它的那个用户有效，换别人用必须失败。
+#[tokio::test]
+async fn media_ticket_is_bound_to_its_owner() {
+    let f = fixture("sec_ticket_owner").await;
+    let (alice, _) = add_user(&f, "alice_t").await;
+    let (bob, _) = add_user(&f, "bob_t").await;
+    let (bob_file, _) = add_file(&f, bob, "bob.jpg", b"bob's").await;
+
+    // 用 alice 的票据去读 bob 的文件：票据身份成立，但归属校验必须拦住
+    let alice_ticket = crypto::create_media_ticket(&f.config, alice, 3600);
+    let res = router(&f)
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/files/{}/download?ticket={}",
+                    bob_file, alice_ticket
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::NOT_FOUND,
+        "票据只回答「你是谁」，能看哪份文件仍由 owner_id 把关"
+    );
 
     f.cleanup().await;
 }
@@ -1103,7 +1219,7 @@ async fn batch_unshare_does_not_leak_other_users_filenames() {
             "POST",
             "/api/batch/unshare",
             &attacker_token,
-            &format!(r#"{{"file_ids":[{}]}}"#, victim_file),
+            &format!(r#"{{"items":[{{"type":"file","id":{}}}]}}"#, victim_file),
         ))
         .await
         .unwrap();
@@ -1114,7 +1230,7 @@ async fn batch_unshare_does_not_leak_other_users_filenames() {
         !raw.contains("私密写真") && !raw.contains("客户张三"),
         "响应里绝不能出现他人文件名，实际: {raw}"
     );
-    let name = body["data"]["results"][0]["file_name"]
+    let name = body["data"]["results"][0]["name"]
         .as_str()
         .unwrap_or_default();
     assert_eq!(name, "(未知)", "非本人的文件应显示占位符");
@@ -1130,7 +1246,13 @@ async fn batch_unshare_rejects_oversized_request() {
     let ids: Vec<String> = (1..=(crate::services::batch_service::MAX_BATCH_SIZE + 1))
         .map(|i| i.to_string())
         .collect();
-    let payload = format!(r#"{{"file_ids":[{}]}}"#, ids.join(","));
+    let payload = format!(
+        r#"{{"items":[{}]}}"#,
+        ids.iter()
+            .map(|i| format!(r#"{{"type":"file","id":{}}}"#, i))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
 
     let res = router(&f)
         .oneshot(authed_json("POST", "/api/batch/unshare", &token, &payload))
@@ -1161,7 +1283,7 @@ async fn soft_deleting_a_file_revokes_its_share() {
             "POST",
             "/api/shares",
             &token,
-            &format!(r#"{{"file_id":{},"expires_hours":null,"password":null,"max_downloads":null,"custom_code":null}}"#, file_id),
+            &format!(r#"{{"items":[{{"type":"file","id":{}}}],"expires_hours":null,"password":null,"max_downloads":null,"custom_code":null}}"#, file_id),
         ))
         .await
         .unwrap();
@@ -1172,7 +1294,7 @@ async fn soft_deleting_a_file_revokes_its_share() {
     let res = router(&f)
         .oneshot(
             Request::builder()
-                .uri(format!("/api/public/shares/{}/download", share_id))
+                .uri(format!("/api/public/shares/{}/download?file_id={}", share_id, file_id))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1191,7 +1313,7 @@ async fn soft_deleting_a_file_revokes_its_share() {
     let res = router(&f)
         .oneshot(
             Request::builder()
-                .uri(format!("/api/public/shares/{}/download", share_id))
+                .uri(format!("/api/public/shares/{}/download?file_id={}", share_id, file_id))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1304,60 +1426,70 @@ fn multipart_with_folder(folder_id: &str, filename: &str, content: &[u8]) -> Vec
 
 #[tokio::test]
 async fn login_is_throttled_after_repeated_failures() {
-    crate::utils::login_throttle::reset_for_test();
     let f = fixture("sec_login_throttle").await;
     add_user(&f, "victim_acct").await;
 
-    // 连续错误密码
-    let mut last_status = StatusCode::OK;
-    for _ in 0..12 {
-        let res = router(&f)
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/auth/login")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{"username":"victim_acct","password":"wrong"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        last_status = res.status();
-        if last_status == StatusCode::TOO_MANY_REQUESTS {
-            break;
+    let attempt = |password: &'static str| {
+        let f = &f;
+        async move {
+            router(f)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/auth/login")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(format!(
+                            r#"{{"username":"victim_acct","password":"{}"}}"#,
+                            password
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
         }
+    };
+
+    // ① 先真打几次错误密码，确认「失败会被记进限流器」这条链路是通的。
+    //    刻意只打 3 次（< 阈值 5）：这一段的目的是验证记账，不是验证退避。
+    for _ in 0..3 {
+        assert_eq!(attempt("wrong").await, StatusCode::UNAUTHORIZED);
     }
+
+    // ② 直接把计数推过阈值，再发**一次**请求断言被拒。
+    //
+    //    为什么不在这里继续打满 5 次然后断言 429：那要求这几次请求全部落在
+    //    退避窗口内，而窗口是从「最后一次失败」起算的固定 5 秒（BASE_BACKOFF）。
+    //    并行跑整个测试套件时，每次登录都要等 bcrypt（现在走 4 个许可的信号量，
+    //    会和其它用例排队），单次可能耗时数秒 —— 窗口在断言之前就过期了，
+    //    于是测试随机失败。实测：并行下约 1/4 的运行会挂，单独跑则 100% 通过。
+    //
+    //    推过阈值之后只发一次请求，它必然落在窗口内，断言因此是确定的。
+    //    被验证的产品行为没有变：入口在**查库与 bcrypt 之前**先问限流器，
+    //    命中退避就返回 429。
+    for _ in 0..crate::utils::login_throttle::THRESHOLD {
+        crate::utils::login_throttle::record_failure("victim_acct", "");
+    }
+
     assert_eq!(
-        last_status,
+        attempt("wrong").await,
         StatusCode::TOO_MANY_REQUESTS,
-        "连续爆破后必须返回 429，否则公网上可无限试"
+        "退避期内必须返回 429，否则公网上可无限试"
     );
 
-    // 正确密码也暂时进不来（退避期内）
-    let res = router(&f)
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/login")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"username":"victim_acct","password":"secret123"}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    // ③ 退避期内**正确密码**同样进不来 —— 这是限流真正要挡住的东西：
+    //    若只在密码错时才拦，攻击者猜中那一次就直接绕过了退避。
+    assert_eq!(
+        attempt("secret123").await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "退避期内正确密码也不该放行"
+    );
 
-    crate::utils::login_throttle::reset_for_test();
     f.cleanup().await;
 }
 
 #[tokio::test]
 async fn normal_login_is_not_throttled() {
-    crate::utils::login_throttle::reset_for_test();
     let f = fixture("sec_login_ok").await;
     add_user(&f, "good_acct").await;
 
@@ -1393,7 +1525,9 @@ async fn normal_login_is_not_throttled() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK, "他人失败不得影响该账号登录");
 
-    crate::utils::login_throttle::reset_for_test();
+    // 这里**不**调 `login_throttle::reset_for_test()`：它清的是进程级全局表，
+    // 而 `login_throttle` 自己的测试正并行观察着同一张表，一清就会让它们随机
+    // 失败。本用例用的都是独有用户名（good_acct / a..h），本来也不会与别人串味。
     f.cleanup().await;
 }
 
@@ -1418,7 +1552,7 @@ async fn concurrent_downloads_cannot_exceed_max_downloads() {
             "POST",
             "/api/shares",
             &token,
-            &format!(r#"{{"file_id":{},"expires_hours":null,"password":null,"max_downloads":3,"custom_code":null}}"#, file_id),
+            &format!(r#"{{"items":[{{"type":"file","id":{}}}],"expires_hours":null,"password":null,"max_downloads":3,"custom_code":null}}"#, file_id),
         ))
         .await
         .unwrap();
@@ -1430,7 +1564,7 @@ async fn concurrent_downloads_cannot_exceed_max_downloads() {
     let reqs: Vec<_> = (0..8)
         .map(|_| {
             Request::builder()
-                .uri(format!("/api/public/shares/{}/download", share_id))
+                .uri(format!("/api/public/shares/{}/download?file_id={}", share_id, file_id))
                 .body(Body::empty())
                 .unwrap()
         })
@@ -1473,7 +1607,7 @@ async fn download_slot_is_not_consumed_when_quota_exhausted() {
             "POST",
             "/api/shares",
             &token,
-            &format!(r#"{{"file_id":{},"expires_hours":null,"password":null,"max_downloads":1,"custom_code":null}}"#, file_id),
+            &format!(r#"{{"items":[{{"type":"file","id":{}}}],"expires_hours":null,"password":null,"max_downloads":1,"custom_code":null}}"#, file_id),
         ))
         .await
         .unwrap();
@@ -1484,7 +1618,7 @@ async fn download_slot_is_not_consumed_when_quota_exhausted() {
     let res = router(&f)
         .oneshot(
             Request::builder()
-                .uri(format!("/api/public/shares/{}/download", share_id))
+                .uri(format!("/api/public/shares/{}/download?file_id={}", share_id, file_id))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1496,7 +1630,7 @@ async fn download_slot_is_not_consumed_when_quota_exhausted() {
     let res = router(&f)
         .oneshot(
             Request::builder()
-                .uri(format!("/api/public/shares/{}/download", share_id))
+                .uri(format!("/api/public/shares/{}/download?file_id={}", share_id, file_id))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1908,27 +2042,42 @@ async fn invite_code_admin_endpoints_require_admin() {
 
     f.cleanup().await;
 }
-/// 请求日志不得包含 query string 里的令牌。
+/// 请求日志不得包含 query string 里的凭据。
 ///
-/// 本项目的缩略图/预览图走 `?token=<JWT>` 旁路（`<img src>` 带不了
-/// Authorization 头，见 frontend/src/api.js），而 `TraceLayer::new_for_http()`
-/// 的默认实现会把完整 URI（含 query）写进 span。后果是**每加载一次缩略图
-/// 就把一个 7 天有效期的 bearer token 明文写进日志**，compose 还配了
-/// 10m×3 轮转，等于把凭据复制三份留在磁盘上。
+/// 缩略图/预览图走查询串旁路（`<img src>` 带不了 Authorization 头，
+/// 见 frontend/src/api.js），而 `TraceLayer::new_for_http()` 的默认实现会把
+/// 完整 URI（含 query）写进 span。后果是**每加载一次缩略图就把一枚凭据明文
+/// 写进日志**，compose 还配了 10m×3 轮转，等于把凭据复制三份留在磁盘上。
+///
+/// 底层凭据已从 JWT 换成窄口径的 media ticket（见 utils::crypto），
+/// 但「日志不该记 query」这条与凭据种类无关，仍然必须独立成立。
 ///
 /// 断言打在真实渲染出的日志行上，而不是 span 内部结构——这样测的是
 /// 「运维最终会在日志里看到什么」，与内部实现解耦。
+///
+/// ## 为什么用「进程级 subscriber + 每线程缓冲」而不是 `with_default`
+///
+/// 最初这里用的是 `tracing::subscriber::with_default(...)` 装一个线程本地
+/// subscriber。它**在并行跑整个测试套件时不可靠**：约 1/4 的运行里缓冲是空的
+/// （请求本身正常完成、返回 404，但一条日志都没落进来），断言随机失败；
+/// 单独跑则 100% 通过。加 `FmtSpan::NEW` 让 span 一创建就输出也没用 ——
+/// 说明问题不在「span 内部有没有事件」，而在线程本地 dispatch 根本没生效。
+///
+/// 现在改成：整个测试二进制只装一次**全局** subscriber（全局默认不依赖线程
+/// 状态，不存在这个竞态），写入端再按线程分流到各自的缓冲。这样每个用例读到的
+/// 仍然只是**自己线程**产出的日志，与 `with_default` 的语义一致，但不再有竞态。
 #[test]
-fn request_log_never_contains_token_from_query_string() {
-    use std::sync::{Arc, Mutex};
+fn request_log_never_contains_credential_from_query_string() {
+    // 每个线程一个日志缓冲：全局 subscriber 会把所有用例的日志都送进来，
+    // 按线程分流之后，本用例只读自己那一条流。
+    thread_local! {
+        static LOG_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
 
-    /// 把格式化后的日志行收集起来
-    #[derive(Clone)]
-    struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for SharedBuffer {
+    struct TlWriter;
+    impl std::io::Write for TlWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
+            LOG_BUF.with(|b| b.borrow_mut().extend_from_slice(buf));
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -1936,33 +2085,39 @@ fn request_log_never_contains_token_from_query_string() {
         }
     }
 
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuffer {
-        type Writer = SharedBuffer;
+    #[derive(Clone, Copy)]
+    struct TlMakeWriter;
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TlMakeWriter {
+        type Writer = TlWriter;
         fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
+            TlWriter
         }
     }
 
-    let buf = SharedBuffer(Arc::new(Mutex::new(Vec::new())));
-    let subscriber = tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(buf.clone()),
-        )
-        // 请求日志是 DEBUG 级，测试里显式打开——
-        // 这正是「有人把 RUST_LOG 调成 debug」时的情形。
-        .with(tracing_subscriber::filter::LevelFilter::DEBUG);
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(TlMakeWriter)
+                    // span 一创建就输出一行，断言不依赖 span 内部是否有事件。
+                    .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW),
+            )
+            // 请求日志是 DEBUG 级，测试里显式打开——
+            // 这正是「有人把 RUST_LOG 调成 debug」时的情形。
+            .with(tracing_subscriber::filter::LevelFilter::DEBUG);
+        // 装不上（例如别处已装过）就让断言自然失败，不静默跳过。
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
 
     // 走**真实的路由器**，而不是直接调 `default_make_span`。
     // 直接调函数的话，把 build_router 里的 make_span_with 摘掉测试照样绿
     // ——它测的只是那个函数自己，测不到「实际生效的 layer 用的是哪个」。
     // 只有真打一次请求，才能锁住「运维最终在日志里看到什么」。
     //
-    // 这是一个 #[test] 而不是 #[tokio::test]：tracing 的 subscriber 是
-    // **线程局部**的，而 tokio 多线程运行时会把这个 future 调度到别的线程上，
-    // 那里没有装 subscriber，日志就采集不到了。current_thread 运行时保证
-    // 整个请求都在当前线程被 poll。
+    // 这是一个 #[test] 而不是 #[tokio::test]：我们要控制请求跑在哪个线程上
+    // （读的是该线程的缓冲），所以自己建一个 current_thread 运行时。
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1972,7 +2127,7 @@ fn request_log_never_contains_token_from_query_string() {
     let (_uid, token) = rt.block_on(add_user(&f, "someone"));
 
     let secret = format!("{}TOPSECRETPART", &token[..40]);
-    let uri = format!("/api/files/42/media?token={}&v=1", secret);
+    let uri = format!("/api/files/42/media?ticket={}&v=1", secret);
     let req = Request::builder()
         .method("GET")
         .uri(&uri)
@@ -1980,13 +2135,12 @@ fn request_log_never_contains_token_from_query_string() {
         .body(Body::empty())
         .expect("构造请求失败");
 
-    tracing::subscriber::with_default(subscriber, || {
-        rt.block_on(async {
-            let _ = router(&f).oneshot(req).await;
-        });
+    LOG_BUF.with(|b| b.borrow_mut().clear());
+    rt.block_on(async {
+        let _ = router(&f).oneshot(req).await;
     });
+    let log = LOG_BUF.with(|b| String::from_utf8_lossy(&b.borrow()).into_owned());
 
-    let log = String::from_utf8(buf.0.lock().unwrap().clone()).expect("日志应是 UTF-8");
     assert!(
         !log.contains("TOPSECRETPART"),
         "日志里出现了令牌明文：{log}"
@@ -1995,11 +2149,151 @@ fn request_log_never_contains_token_from_query_string() {
         log.contains("/api/files/42/media"),
         "路径应保留在日志里，否则失去排障价值；实际：{log}"
     );
-    // query 整体都不该出现，不只是 token 这一段
+    // query 整体都不该出现，不只是凭据那一段
+    assert!(!log.contains("ticket="), "日志里出现了凭据 query：{log}");
+    assert!(!log.contains("v=1"), "日志里出现了 query 串：{log}");
+}
+
+// ---------------------------------------------------------------------------
+// SPA 深链回退
+// ---------------------------------------------------------------------------
+//
+// 原先只给 `/share/*` 挂了回退，于是 `/admin`、`/search`、`/trash` 直接访问
+// 或刷新会 404。单页内导航看不出来，但「把 /admin 收藏了再点开」是很自然的
+// 动作 —— 局域网里容易忽略，公网上就是一句「你给的链接打不开」。
+
+#[tokio::test]
+async fn spa_deep_links_serve_index_html() {
+    let f = fixture("spa_deeplink").await;
+
+    for path in [
+        "/",
+        "/admin",
+        "/search",
+        "/trash",
+        "/shares",
+        // 更深的路径同样要回退：前端路由将来加子路径时不必再改后端
+        "/admin/users/3",
+        "/share/not-a-real-share-id",
+    ] {
+        let res = router(&f)
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{path} 应回退到 index.html");
+
+        let ct = res
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("text/html"),
+            "{path} 的 Content-Type 应为 text/html，实际 {ct}"
+        );
+
+        let body = body_text(res).await;
+        assert!(
+            body.contains("SPA-MARKER"),
+            "{path} 应返回 index.html 的内容，实际 {body}"
+        );
+    }
+
+    f.cleanup().await;
+}
+
+/// 静态资源必须优先于回退命中，否则 JS / CSS / favicon 全都会被换成 HTML。
+#[tokio::test]
+async fn static_assets_win_over_the_spa_fallback() {
+    let f = fixture("spa_assets").await;
+
+    let res = router(&f)
+        .oneshot(
+            Request::builder()
+                .uri("/assets/app.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_text(res).await;
     assert!(
-        !log.contains("token="),
-        "日志里出现了 query 串：{log}"
+        body.contains("console.log('asset')"),
+        "静态资源被回退盖掉了：{body}"
     );
+    assert!(!body.contains("SPA-MARKER"), "静态资源不该拿到 index.html");
+
+    f.cleanup().await;
+}
+
+/// 未匹配的 `/api/` 路径继续返回 JSON 404。
+///
+/// 若也回退成 index.html，前端把端点名拼错时会拿到一坨 HTML，
+/// axios 解析失败后报出的错误与真实原因毫无关系，排查成本陡增。
+#[tokio::test]
+async fn unknown_api_paths_still_return_json_404() {
+    let f = fixture("spa_api404").await;
+
+    for path in ["/api/nope", "/api/files/1/nonexistent"] {
+        let res = router(&f)
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "{path} 应为 404");
+        let body = json_body(res).await;
+        assert_eq!(
+            body["success"], false,
+            "{path} 应返回统一信封的 JSON，实际 {body}"
+        );
+    }
+
+    f.cleanup().await;
+}
+
+/// 全站安全响应头。逐条都是「没加就等于没防」的那类。
+#[tokio::test]
+async fn security_headers_are_present_on_every_response() {
+    let f = fixture("sec_headers").await;
+    let (uid, token) = add_user(&f, "hdr").await;
+    let (file_id, _) = add_file(&f, uid, "a.jpg", b"x").await;
+
+    // 覆盖三类响应：API、静态资源 / SPA 回退、媒体流
+    let cases: Vec<(String, Option<String>)> = vec![
+        ("/api/health".to_string(), None),
+        ("/admin".to_string(), None),
+        (
+            format!("/api/files/{}/download", file_id),
+            Some(format!("Bearer {}", token)),
+        ),
+    ];
+
+    for (uri, auth) in cases {
+        let mut req = Request::builder().uri(&uri);
+        if let Some(a) = &auth {
+            req = req.header(header::AUTHORIZATION, a);
+        }
+        let res = router(&f)
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        for (name, want) in [
+            (header::X_FRAME_OPTIONS, "SAMEORIGIN"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ] {
+            let got = res
+                .headers()
+                .get(&name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert_eq!(got, want, "{uri} 缺少 {name:?} 或其值不符");
+        }
+    }
+
+    f.cleanup().await;
 }
 
 /// 一张 1×1 的合法 PNG，用于验证「白名单内类型仍可内联预览」。
@@ -2101,17 +2395,26 @@ async fn insert_share(
     };
     let id = uuid::Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO file_shares (id, file_id, owner_id, password_hash, max_downloads)
-         VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO file_shares (id, owner_id, password_hash, max_downloads)
+         VALUES (?, ?, ?, ?)",
     )
     .bind(&id)
-    .bind(file_id)
     .bind(owner_id)
     .bind(&hash)
     .bind(max_downloads)
     .execute(&f.pool)
     .await
     .expect("插入分享失败");
+    if let Some(fid) = file_id {
+        sqlx::query(
+            "INSERT INTO share_items (share_id, item_type, item_id) VALUES (?, 'file', ?)",
+        )
+        .bind(&id)
+        .bind(fid)
+        .execute(&f.pool)
+        .await
+        .expect("插入批次条目失败");
+    }
     id
 }
 
@@ -2264,7 +2567,7 @@ async fn public_share_media_honours_the_inline_whitelist() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri(format!("/api/public/shares/{}/media", share_id))
+                .uri(format!("/api/public/shares/{}/media?file_id={}", share_id, _id))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2304,7 +2607,7 @@ async fn public_share_media_still_inlines_real_images() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri(format!("/api/public/shares/{}/media", share_id))
+                .uri(format!("/api/public/shares/{}/media?file_id={}", share_id, _id))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2339,7 +2642,7 @@ async fn public_share_download_encodes_unicode_filenames() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri(format!("/api/public/shares/{}/download", share_id))
+                .uri(format!("/api/public/shares/{}/download?file_id={}", share_id, _id))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2448,4 +2751,1505 @@ fn tiny_images_are_allowed() {
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(res.is_ok(), "1x1 的图不应被拒，实际错误：{:?}", res.err());
+}
+
+// ---------------------------------------------------------------------------
+// 有密码分享：验码之后必须能看到预览
+// ---------------------------------------------------------------------------
+//
+// 回归的是这样一条链：`share_to_info` 曾经写成
+// `if !password_hash.is_empty() { None }` —— 媒体 URL 的下发只取决于
+// 「这个分享有没有密码」，与请求带没带 ticket 完全无关。于是受密码保护的分享
+// 无论访客输没输对密码，`preview_url` 永远是 null，前端 PublicShare.vue 的
+// 媒体区永远走 fallback 分支显示「该文件类型暂不支持在线预览」。
+//
+// 而「有密码的交付链接」正是本项目的核心用法，`verify()` 之后重新 load()
+// 这条前端流程本就是为它设计的 —— 只是后端从没配合过。
+
+// 注：这些用例**不能**调 `login_throttle::reset_for_test()`。那个函数清的是
+// 进程级全局表，而 `login_throttle` 自己的测试正并行观察着同一张表 —— 一清就会
+// 让它们随机失败（实测：`backoff_counts_down_as_time_passes` 会偶发挂掉）。
+// 这里本来也不需要：每个用例都新建一个 uuid4 分享码，`/verify` 的限流按分享码
+// 分桶，天然互不干扰；每个用例最多失败一次，也够不到 5 次的阈值。
+
+#[tokio::test]
+async fn password_share_shows_media_only_after_verifying() {
+    let f = fixture("share_pwd_media").await;
+    let (uid, token) = add_user(&f, "shooter").await;
+    let (file_id, _) = add_file(&f, uid, "wedding.jpg", b"pretend-jpeg").await;
+
+    // 造出真实的预览/缩略图文件，并写回记录 —— 让「有预览」这个前提成立
+    let preview_dir = f
+        .config
+        .upload_dir
+        .join(format!("user_{}", uid))
+        .join("previews");
+    std::fs::create_dir_all(&preview_dir).unwrap();
+    std::fs::write(preview_dir.join("p.jpg"), b"preview-bytes").unwrap();
+    std::fs::write(preview_dir.join("t.jpg"), b"thumb-bytes").unwrap();
+    sqlx::query("UPDATE files SET preview_path = ?, thumb_path = ? WHERE id = ?")
+        .bind(format!("user_{}/previews/p.jpg", uid))
+        .bind(format!("user_{}/previews/t.jpg", uid))
+        .bind(file_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+    let res = router(&f)
+        .oneshot(authed_json(
+            "POST",
+            "/api/shares",
+            &token,
+            &format!(
+                r#"{{"items":[{{"type":"file","id":{}}}],"expires_hours":null,"password":"letmein","max_downloads":null,"custom_code":null}}"#,
+                file_id
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let share_id = json_body(res).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // ① 还没验码：媒体 URL 一律不下发（密码门不能只靠前端自觉）
+    let res = router(&f)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/public/shares/{}", share_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = json_body(res).await;
+    assert_eq!(body["data"]["has_password"], true);
+    assert!(
+        body["data"]["preview_url"].is_null() && body["data"]["thumb_url"].is_null(),
+        "未验码就下发媒体 URL 等于密码门形同虚设：{body}"
+    );
+
+    // ② 验码拿到 ticket
+    let res = router(&f)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/public/shares/{}/verify", share_id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"password":"letmein"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "口令正确应签发 ticket");
+    let ticket = json_body(res).await["data"]["ticket"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(!ticket.is_empty());
+
+    // ③ **带票重新拉详情 —— 这一步在修复前恒为 null。**
+    //    前端 PublicShare.vue 的 verify() 正是这么做的。
+    let res = router(&f)
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/public/shares/{}?ticket={}",
+                    share_id, ticket
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = json_body(res).await;
+    // 批次模型下媒体地址挂在**每个条目**上，不再是分享的顶层字段。
+    let item = &body["data"]["items"][0];
+    assert_eq!(item["item_type"], "file");
+    let preview_url = item["preview_url"].as_str().unwrap_or("");
+    assert!(
+        preview_url.contains("/media"),
+        "验码后必须下发预览地址，否则客户永远看不到图：{body}"
+    );
+    assert!(
+        !item["thumb_url"].is_null(),
+        "验码后缩略图地址同样应下发：{body}"
+    );
+
+    // ④ URL 要真的能用（否则「下发了」只是好看）
+    let res = router(&f)
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/public/shares/{}/media?file_id={}&thumb=1&ticket={}",
+                    share_id, file_id, ticket
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, "thumb-bytes");
+
+    // ⑤ 没有票时媒体接口仍然拒绝
+    let res = router(&f)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/public/shares/{}/media?file_id={}&thumb=1", share_id, file_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    f.cleanup().await;
+}
+
+/// 无密码分享：不带任何凭证也要能看到预览（别把上面那条修过头）。
+#[tokio::test]
+async fn open_share_shows_media_without_any_credential() {
+    let f = fixture("share_open_media").await;
+    let (uid, token) = add_user(&f, "open_shooter").await;
+    let (file_id, _) = add_file(&f, uid, "open.jpg", b"x").await;
+
+    let preview_dir = f
+        .config
+        .upload_dir
+        .join(format!("user_{}", uid))
+        .join("previews");
+    std::fs::create_dir_all(&preview_dir).unwrap();
+    std::fs::write(preview_dir.join("p.jpg"), b"preview-bytes").unwrap();
+    sqlx::query("UPDATE files SET preview_path = ? WHERE id = ?")
+        .bind(format!("user_{}/previews/p.jpg", uid))
+        .bind(file_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+    let res = router(&f)
+        .oneshot(authed_json(
+            "POST",
+            "/api/shares",
+            &token,
+            &format!(
+                r#"{{"items":[{{"type":"file","id":{}}}],"expires_hours":null,"password":null,"max_downloads":null,"custom_code":null}}"#,
+                file_id
+            ),
+        ))
+        .await
+        .unwrap();
+    let share_id = json_body(res).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let res = router(&f)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/public/shares/{}", share_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = json_body(res).await;
+    assert_eq!(body["data"]["has_password"], false);
+    assert!(
+        !body["data"]["items"][0]["preview_url"].is_null(),
+        "无密码分享本就该直接给预览地址：{body}"
+    );
+
+    f.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// max_downloads 不能从 /media 绕过去
+// ---------------------------------------------------------------------------
+//
+// `/media` 在没有预览图时会回退到 `stored_path`，也就是**完整原片**。
+// 原先只有 `/download` 会占用额度，于是设了「最多下载 1 次」的分享，
+// 任何人都能用 `/media` 无限次拿走原图，而 download_count 一直是 0。
+
+#[tokio::test]
+async fn media_endpoint_consumes_a_download_slot_when_serving_the_original() {
+    let f = fixture("share_media_slot").await;
+    let (uid, token) = add_user(&f, "slot_shooter").await;
+    // 视频没有预览图 → /media 必定走原片回退分支
+    let (file_id, _) = add_file(&f, uid, "clip.mp4", b"the-whole-video").await;
+
+    let res = router(&f)
+        .oneshot(authed_json(
+            "POST",
+            "/api/shares",
+            &token,
+            &format!(
+                r#"{{"items":[{{"type":"file","id":{}}}],"expires_hours":null,"password":null,"max_downloads":1,"custom_code":null}}"#,
+                file_id
+            ),
+        ))
+        .await
+        .unwrap();
+    let share_id = json_body(res).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 第一次 /media：拿到原片，并占用掉唯一一次额度
+    let res = router(&f)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/public/shares/{}/media?file_id={}", share_id, file_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "首次应能取到内容");
+    assert_eq!(body_text(res).await, "the-whole-video");
+
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT download_count FROM file_shares WHERE id = ?")
+            .bind(&share_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 1, "回退到原片必须占用下载额度，否则限制形同虚设");
+
+    // 第二次必须被额度拦住（与 /download 的行为一致）
+    let res = router(&f)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/public/shares/{}/media?file_id={}", share_id, file_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::GONE,
+        "额度用尽后 /media 也必须拒绝"
+    );
+
+    f.cleanup().await;
+}
+
+/// 派生出来的预览图不该占用下载额度 —— 否则客户每看一眼就少一次下载机会。
+#[tokio::test]
+async fn media_endpoint_does_not_charge_for_preview_derivatives() {
+    let f = fixture("share_media_preview_free").await;
+    let (uid, token) = add_user(&f, "preview_shooter").await;
+    let (file_id, _) = add_file(&f, uid, "shot.jpg", b"original-bytes").await;
+
+    let preview_dir = f
+        .config
+        .upload_dir
+        .join(format!("user_{}", uid))
+        .join("previews");
+    std::fs::create_dir_all(&preview_dir).unwrap();
+    std::fs::write(preview_dir.join("p.jpg"), b"small-preview").unwrap();
+    sqlx::query("UPDATE files SET preview_path = ? WHERE id = ?")
+        .bind(format!("user_{}/previews/p.jpg", uid))
+        .bind(file_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+    let res = router(&f)
+        .oneshot(authed_json(
+            "POST",
+            "/api/shares",
+            &token,
+            &format!(
+                r#"{{"items":[{{"type":"file","id":{}}}],"expires_hours":null,"password":null,"max_downloads":1,"custom_code":null}}"#,
+                file_id
+            ),
+        ))
+        .await
+        .unwrap();
+    let share_id = json_body(res).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for _ in 0..3 {
+        let res = router(&f)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/public/shares/{}/media?file_id={}&preview=1", share_id, file_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "预览图应始终可取");
+        assert_eq!(body_text(res).await, "small-preview");
+    }
+
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT download_count FROM file_shares WHERE id = ?")
+            .bind(&share_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0, "看预览图不该消耗下载额度");
+
+    f.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// 管理员不可降级
+// ---------------------------------------------------------------------------
+//
+// 修复前：唯一的管理员把自己设成普通用户之后，没有任何入口能改回来 ——
+// 只能进容器手改数据库，而触发它只需在界面下拉框里点一下。
+
+async fn promote(f: &Fixture, user_id: i64) {
+    sqlx::query("UPDATE users SET role = 'admin' WHERE id = ?")
+        .bind(user_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_admin_cannot_be_demoted_through_any_endpoint() {
+    let f = fixture("admin_no_demote").await;
+    let (alice, alice_token) = add_user(&f, "alice_admin").await;
+    let (bob, _bob_token) = add_user(&f, "bob_admin").await;
+    promote(&f, alice).await;
+    promote(&f, bob).await;
+
+    // ① 降级自己
+    let res = router(&f)
+        .oneshot(authed_json(
+            "PUT",
+            &format!("/api/admin/users/{}/role", alice),
+            &alice_token,
+            r#"{"role":"user"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "管理员不应能把自己降级"
+    );
+
+    // ② 降级另一个管理员
+    let res = router(&f)
+        .oneshot(authed_json(
+            "PUT",
+            &format!("/api/admin/users/{}/role", bob),
+            &alice_token,
+            r#"{"role":"user"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "管理员不应能被降级（无论由谁操作）"
+    );
+
+    // ③ 走 update_user 这条同样能改角色的路
+    let res = router(&f)
+        .oneshot(authed_json(
+            "PUT",
+            &format!("/api/admin/users/{}", bob),
+            &alice_token,
+            r#"{"role":"user"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "update_user 也必须挡住降级，否则换个端点就绕过去了"
+    );
+
+    // 两边的角色都没被动过
+    let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'admin'")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(admins, 2, "被拒绝的请求不该留下任何副作用");
+
+    f.cleanup().await;
+}
+
+/// 挡降级不等于挡住正常操作：提升普通用户为管理员必须照常可用。
+#[tokio::test]
+async fn promoting_a_user_to_admin_still_works() {
+    let f = fixture("admin_promote_ok").await;
+    let (alice, alice_token) = add_user(&f, "alice_p").await;
+    let (bob, _) = add_user(&f, "bob_p").await;
+    promote(&f, alice).await;
+
+    let res = router(&f)
+        .oneshot(authed_json(
+            "PUT",
+            &format!("/api/admin/users/{}/role", bob),
+            &alice_token,
+            r#"{"role":"admin"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let role: String = sqlx::query_scalar("SELECT role FROM users WHERE id = ?")
+        .bind(bob)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(role, "admin");
+
+    f.cleanup().await;
+}
+
+/// 系统里必须始终留着管理员：自己删不掉自己（第一道闸），
+/// 且删到只剩一个时第二道闸也会拦。
+#[tokio::test]
+async fn the_last_admin_cannot_be_deleted() {
+    let f = fixture("admin_last_one").await;
+    let (alice, alice_token) = add_user(&f, "alice_last").await;
+    let (bob, _) = add_user(&f, "bob_last").await;
+    promote(&f, alice).await;
+    promote(&f, bob).await;
+
+    // 先删掉 bob，此时只剩 alice
+    let res = router(&f)
+        .oneshot(authed_json(
+            "DELETE",
+            &format!("/api/admin/users/{}", bob),
+            &alice_token,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // alice 删不掉自己 —— 这条保护本来就有，此处锁住它不被将来重构掉
+    let res = router(&f)
+        .oneshot(authed_json(
+            "DELETE",
+            &format!("/api/admin/users/{}", alice),
+            &alice_token,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'admin'")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(admins, 1, "系统里必须始终留有管理员");
+
+    f.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// 回收站语义：单独删除的文件与「跟着文件夹一起删」的文件不是一回事
+// ---------------------------------------------------------------------------
+
+async fn add_file_in(f: &Fixture, owner_id: i64, folder_id: i64, name: &str) -> i64 {
+    let (id, _) = add_file(f, owner_id, name, b"bytes").await;
+    sqlx::query("UPDATE files SET folder_id = ? WHERE id = ?")
+        .bind(folder_id)
+        .bind(id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    id
+}
+
+async fn is_in_trash(f: &Fixture, file_id: i64) -> bool {
+    let deleted_at: Option<String> =
+        sqlx::query_scalar("SELECT deleted_at FROM files WHERE id = ?")
+            .bind(file_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    deleted_at.is_some()
+}
+
+#[tokio::test]
+async fn restoring_a_folder_does_not_resurrect_separately_deleted_files() {
+    let f = fixture("trash_restore_folder").await;
+    let (uid, token) = add_user(&f, "trash_user").await;
+    let folder = add_folder(&f, uid, "婚礼", None).await;
+    let a = add_file_in(&f, uid, folder, "a.jpg").await; // 稍后单独删掉
+    let b = add_file_in(&f, uid, folder, "b.jpg").await;
+
+    // 用户先单独删掉 a
+    let res = router(&f)
+        .oneshot(authed_json("DELETE", &format!("/api/files/{}", a), &token, ""))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 再删掉整个文件夹
+    let res = router(&f)
+        .oneshot(authed_json(
+            "DELETE",
+            &format!("/api/folders/{}", folder),
+            &token,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(is_in_trash(&f, b).await, "随文件夹删除的文件应进回收站");
+
+    // 恢复文件夹
+    let res = router(&f)
+        .oneshot(authed_json(
+            "POST",
+            &format!("/api/folders/{}/restore", folder),
+            &token,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    assert!(!is_in_trash(&f, b).await, "跟着文件夹删掉的 b 应被恢复");
+    assert!(
+        is_in_trash(&f, a).await,
+        "此前被单独删除的 a 不该跟着复活 —— 那看起来就是「没要求恢复的东西自己回来了」"
+    );
+
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn permanently_deleting_a_folder_keeps_separately_trashed_files() {
+    let f = fixture("trash_purge_folder").await;
+    let (uid, token) = add_user(&f, "purge_user").await;
+    let folder = add_folder(&f, uid, "选片", None).await;
+    let a = add_file_in(&f, uid, folder, "a.jpg").await; // 单独删掉的
+    let b = add_file_in(&f, uid, folder, "b.jpg").await;
+
+    // 先单独删 a，再删整个文件夹
+    let res = router(&f)
+        .oneshot(authed_json("DELETE", &format!("/api/files/{}", a), &token, ""))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = router(&f)
+        .oneshot(authed_json(
+            "DELETE",
+            &format!("/api/folders/{}", folder),
+            &token,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(is_in_trash(&f, a).await && is_in_trash(&f, b).await);
+
+    // 永久删除文件夹
+    let res = router(&f)
+        .oneshot(authed_json(
+            "DELETE",
+            &format!("/api/folders/{}/permanent", folder),
+            &token,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let b_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE id = ?")
+        .bind(b)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(b_rows, 0, "跟着文件夹删掉的 b 应被硬删");
+
+    let a_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE id = ?")
+        .bind(a)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        a_rows, 1,
+        "单独删除的 a 从没被要求永久删除，记录必须留着（folder_id 会被置空）"
+    );
+
+    // 而且真的还能从回收站恢复
+    let res = router(&f)
+        .oneshot(authed_json(
+            "POST",
+            &format!("/api/files/{}/restore", a),
+            &token,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "a 应当仍可恢复");
+    assert!(!is_in_trash(&f, a).await);
+
+    f.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// 配额口径：按物理文件去重，不按记录条数
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn copying_a_file_does_not_inflate_the_accounted_usage() {
+    let f = fixture("quota_distinct").await;
+    let (uid, token) = add_user(&f, "quota_user").await;
+    let content = vec![0u8; 4096];
+    let (file_id, _) = add_file(&f, uid, "big.jpg", &content).await;
+
+    let before = file_service::used_bytes(&f.pool, uid).await.unwrap();
+    assert_eq!(before, 4096);
+
+    // 复制到根目录：插入新记录，但复用同一个 stored_path
+    let res = router(&f)
+        .oneshot(authed_json(
+            "POST",
+            "/api/batch/copy",
+            &token,
+            &format!(
+                r#"{{"file_ids":[{}],"folder_ids":[],"target_folder_id":null,"conflict_strategy":"rename"}}"#,
+                file_id
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE owner_id = ?")
+        .bind(uid)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 2, "复制应产生第二条记录");
+
+    let after = file_service::used_bytes(&f.pool, uid).await.unwrap();
+    assert_eq!(
+        after, before,
+        "两份记录指向同一份物理字节，用量不该翻倍（磁盘占用并没有变）"
+    );
+
+    // 删掉两份副本后，用量才归零
+    sqlx::query("DELETE FROM files WHERE owner_id = ?")
+        .bind(uid)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(file_service::used_bytes(&f.pool, uid).await.unwrap(), 0);
+
+    f.cleanup().await;
+}
+
+/// 反向要求：复制出的副本不能成为「不计费」的隐身占用。
+///
+/// 即「复制一份 → 删掉原件」之后磁盘上仍有真实字节，
+/// 按 stored_path 去重统计依然算得到它（若改成「不统计副本行」，
+/// 反复「复制再删原件」就能把磁盘撑爆而用量始终很小）。
+#[tokio::test]
+async fn usage_still_counted_when_only_the_copy_remains() {
+    let f = fixture("quota_copy_survives").await;
+    let (uid, _token) = add_user(&f, "quota_survive").await;
+    let (original, _) = add_file(&f, uid, "orig.jpg", &[7u8; 2048]).await;
+
+    // 手工造一份「副本」记录：同一 stored_path，另一行
+    let stored: String = sqlx::query_scalar("SELECT stored_path FROM files WHERE id = ?")
+        .bind(original)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO files (name, original_name, stored_path, owner_id, size, file_type)
+         VALUES ('copy.jpg','copy.jpg',?,?,2048,'jpg')",
+    )
+    .bind(&stored)
+    .bind(uid)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+
+    // 删掉原件，只剩副本
+    sqlx::query("DELETE FROM files WHERE id = ?")
+        .bind(original)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        file_service::used_bytes(&f.pool, uid).await.unwrap(),
+        2048,
+        "磁盘上还有这份文件，用量必须照算"
+    );
+
+    f.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// 上传重名：判定必须与写入在同一条语句里
+// ---------------------------------------------------------------------------
+//
+// 原先 `check_duplicates` 与 `INSERT` 之间有一个窗口，两个并发上传同名文件
+// 会双双入库。现在重名判定被并进了那条 `INSERT ... SELECT ... WHERE`，
+// 与配额校验同源，由数据库一次裁决。
+
+/// 构造一个只含单个 `file` 字段的 multipart 请求。
+fn multipart_upload(uri: &str, token: &str, filename: &str, bytes: &[u8]) -> Request<Body> {
+    const CRLF: &str = "\r\n";
+    let boundary = "----panboundary";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{b}{cr}Content-Disposition: form-data; name=\"file\"; filename=\"{f}\"{cr}\
+             Content-Type: application/octet-stream{cr}{cr}",
+            b = boundary,
+            f = filename,
+            cr = CRLF,
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("{cr}--{b}--{cr}", cr = CRLF, b = boundary).as_bytes());
+
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {}", token))
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={}", boundary),
+        )
+        .body(Body::from(body))
+        .expect("构造上传请求失败")
+}
+
+#[tokio::test]
+async fn uploading_the_same_name_twice_keeps_only_one_row() {
+    let f = fixture("upload_dup_name").await;
+    let (uid, token) = add_user(&f, "dup_user").await;
+
+    let first = router(&f)
+        .oneshot(multipart_upload(
+            "/api/files/upload",
+            &token,
+            "same.jpg",
+            b"first",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    // 第二次传同名文件：应被跳过并给出明确原因，而不是悄悄多出一行
+    let second = router(&f)
+        .oneshot(multipart_upload(
+            "/api/files/upload",
+            &token,
+            "same.jpg",
+            b"second",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        StatusCode::BAD_REQUEST,
+        "全部文件都被跳过时应报错，而不是回 success:true 却什么都没存"
+    );
+
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM files WHERE owner_id = ? AND original_name = 'same.jpg'",
+    )
+    .bind(uid)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, 1, "同一目录下同名文件只能有一行");
+
+    // 内容仍是第一次那份
+    let stored: String = sqlx::query_scalar("SELECT stored_path FROM files WHERE owner_id = ?")
+        .bind(uid)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(f.config.upload_dir.join(&stored)).unwrap(),
+        b"first"
+    );
+
+    // 同时不该留下第二次的孤儿文件（previews/ 是正常的缩略图子目录，不计）
+    let leftovers: Vec<String> =
+        std::fs::read_dir(f.config.upload_dir.join(format!("user_{}", uid)))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+    assert_eq!(
+        leftovers.len(),
+        1,
+        "被跳过的上传不应在磁盘留下文件：{leftovers:?}"
+    );
+
+    f.cleanup().await;
+}
+
+
+// ---------------------------------------------------------------------------
+// 搜索：通配符必须当字面量
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn search_treats_like_wildcards_as_literal_characters() {
+    let f = fixture("search_wildcards").await;
+    let (uid, token) = add_user(&f, "searcher").await;
+    add_file(&f, uid, "holiday.jpg", b"a").await;
+    add_file(&f, uid, "beach.jpg", b"a").await;
+    add_file(&f, uid, "discount 100%.jpg", b"a").await;
+    add_file(&f, uid, "snake_case.jpg", b"a").await;
+
+    // `%` 曾经会被拼成 `%%%` 从而匹配全部文件
+    let res = router(&f)
+        .oneshot(authed_get("/api/search?q=%25", &token))
+        .await
+        .unwrap();
+    let body = json_body(res).await;
+    assert_eq!(
+        body["data"]["total_files"], 1,
+        "搜索 % 应只匹配字面含 % 的文件，实际：{body}"
+    );
+    assert!(body["data"]["files"][0]["original_name"]
+        .as_str()
+        .unwrap()
+        .contains('%'));
+
+    // `_` 曾经会变成「任意单字符」
+    let res = router(&f)
+        .oneshot(authed_get("/api/search?q=_", &token))
+        .await
+        .unwrap();
+    let body = json_body(res).await;
+    assert_eq!(
+        body["data"]["total_files"], 1,
+        "搜索 _ 应只匹配字面含下划线的文件，实际：{body}"
+    );
+    assert_eq!(body["data"]["files"][0]["original_name"], "snake_case.jpg");
+
+    // 普通关键词不受影响
+    let res = router(&f)
+        .oneshot(authed_get("/api/search?q=beach", &token))
+        .await
+        .unwrap();
+    assert_eq!(json_body(res).await["data"]["total_files"], 1);
+
+    f.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// 管理端用户列表：批量统计必须与逐条统计给出同样的数字
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn admin_user_list_reports_the_same_stats_as_the_single_user_view() {
+    let f = fixture("admin_list_stats").await;
+    let (admin, admin_token) = add_user(&f, "list_admin").await;
+    promote(&f, admin).await;
+    let (uid, _) = add_user(&f, "list_target").await;
+
+    // 原图文件夹 + 两个文件（其中一个进回收站）
+    let original = add_folder(&f, uid, "原图", None).await;
+    add_file_in(&f, uid, original, "x.jpg").await;
+    let gone = add_file_in(&f, uid, original, "y.jpg").await;
+    sqlx::query("UPDATE files SET deleted_at = datetime('now') WHERE id = ?")
+        .bind(gone)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+    let res = router(&f)
+        .oneshot(authed_get("/api/admin/users", &admin_token))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = json_body(res).await;
+    let row = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["id"] == uid)
+        .expect("列表里应包含目标用户")
+        .clone();
+
+    assert_eq!(row["file_count"], 1, "file_count 只算未删除的文件");
+    assert_eq!(row["used_bytes"], 10, "用量含回收站：两个文件各 5 字节");
+    assert_eq!(row["original_folder_id"], original);
+
+    // 与逐条统计（`file_service::used_bytes`）对齐
+    assert_eq!(file_service::used_bytes(&f.pool, uid).await.unwrap(), 10);
+
+    f.cleanup().await;
+}
+
+// ===========================================================================
+// 分享批次
+// ---------------------------------------------------------------------------
+// 模型：一个分享 = 一个批次，里面可以同时装多个文件和多个文件夹。
+// 客户端能进目录、能挑文件下载，所以**授权面比原来大得多**——
+// 原来一个分享只指向一个目标，现在要回答「这个 file_id / folder_id 是否
+// 落在这一批的范围内」。下面大半篇幅都在打这个点。
+// ===========================================================================
+
+/// 构造创建批次的 JSON body。`items` 用 `("file"|"folder", id)` 表示。
+fn batch_payload(
+    items: &[(&str, i64)],
+    password: Option<&str>,
+    max_downloads: Option<i64>,
+) -> String {
+    let list = items
+        .iter()
+        .map(|(t, id)| format!(r#"{{"type":"{}","id":{}}}"#, t, id))
+        .collect::<Vec<_>>()
+        .join(",");
+    let pwd = password
+        .map(|p| format!(r#""{}""#, p))
+        .unwrap_or_else(|| "null".to_string());
+    let md = max_downloads
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    format!(
+        r#"{{"items":[{}],"expires_hours":null,"password":{},"max_downloads":{},"custom_code":null}}"#,
+        list, pwd, md
+    )
+}
+
+/// 建一个批次并返回它的 id。
+async fn make_batch(
+    f: &Fixture,
+    token: &str,
+    items: &[(&str, i64)],
+    password: Option<&str>,
+    max_downloads: Option<i64>,
+) -> String {
+    let res = router(f)
+        .oneshot(authed_json(
+            "POST",
+            "/api/shares",
+            token,
+            &batch_payload(items, password, max_downloads),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "创建批次应成功");
+    json_body(res).await["data"]["id"]
+        .as_str()
+        .expect("应返回批次 id")
+        .to_string()
+}
+
+/// 造一棵两层目录树 + 一个兄弟目录，用于验证子树授权的深度：
+///
+/// ```text
+/// 祖先(不在批次里)
+/// └── A ─────────── 批次里只放这个
+///     ├── a1.jpg
+///     └── B
+///         └── b1.jpg
+/// X ────────────── A 的兄弟，同样不在批次里
+/// └── x1.jpg
+/// ```
+struct Tree {
+    ancestor: i64,
+    a: i64,
+    b: i64,
+    a1: i64,
+    b1: i64,
+    x: i64,
+    x1: i64,
+}
+
+async fn build_tree(f: &Fixture, owner: i64) -> Tree {
+    let ancestor = add_folder(f, owner, "祖先", None).await;
+    let a = add_folder(f, owner, "婚礼", Some(ancestor)).await;
+    let b = add_folder(f, owner, "精修", Some(a)).await;
+    let a1 = add_file_in(f, owner, a, "a1.jpg").await;
+    let b1 = add_file_in(f, owner, b, "b1.jpg").await;
+    let x = add_folder(f, owner, "别的客户", None).await;
+    let x1 = add_file_in(f, owner, x, "x1.jpg").await;
+    Tree {
+        ancestor,
+        a,
+        b,
+        a1,
+        b1,
+        x,
+        x1,
+    }
+}
+
+async fn public_get(f: &Fixture, uri: &str) -> axum::response::Response {
+    router(f)
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+// ---- 创建批次 ----
+
+#[tokio::test]
+async fn a_batch_can_mix_files_and_folders() {
+    let f = fixture("batch_mixed").await;
+    let (uid, token) = add_user(&f, "mixer").await;
+    let (loose, _) = add_file(&f, uid, "单张.jpg", b"x").await;
+    let t = build_tree(&f, uid).await;
+
+    let share_id = make_batch(&f, &token, &[("file", loose), ("folder", t.a)], None, None).await;
+
+    let res = public_get(&f, &format!("/api/public/shares/{}", share_id)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = json_body(res).await;
+
+    assert_eq!(body["data"]["item_count"], 2, "顶层应有两项：{body}");
+    assert_eq!(body["data"]["file_count"], 1, "顶层一个文件");
+    assert_eq!(body["data"]["folder_count"], 1, "顶层一个文件夹");
+    // 递归统计：A 下面有 a1 和 B/b1，加上单独那张，共 3 个文件
+    assert_eq!(body["data"]["total_file_count"], 3, "递归文件数应为 3：{body}");
+    // 文件夹先排前面，与主列表页一致
+    assert_eq!(body["data"]["items"][0]["item_type"], "folder");
+    assert_eq!(body["data"]["items"][1]["item_type"], "file");
+
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_batch_rejects_another_users_content() {
+    let f = fixture("batch_cross_user").await;
+    let (victim, _) = add_user(&f, "victim_b").await;
+    let (_attacker, attacker_token) = add_user(&f, "attacker_b").await;
+    let (victim_file, _) = add_file(&f, victim, "客户私密.heic", b"x").await;
+
+    let res = router(&f)
+        .oneshot(authed_json(
+            "POST",
+            "/api/shares",
+            &attacker_token,
+            &batch_payload(&[("file", victim_file)], None, None),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::NOT_FOUND,
+        "把别人的文件放进批次必须被拒"
+    );
+
+    // 全有或全无：一个合法项 + 一个非法项，也应当整批拒绝
+    let (attacker_id, _) = add_user(&f, "attacker_b2").await;
+    let (_mine, _) = add_file(&f, attacker_id, "mine.jpg", b"x").await;
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM file_shares")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "被拒的请求不应留下任何批次");
+
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_batch_rejects_empty_duplicate_and_oversized_payloads() {
+    let f = fixture("batch_bad_payloads").await;
+    let (uid, token) = add_user(&f, "bulk_b").await;
+    let (file_id, _) = add_file(&f, uid, "a.jpg", b"x").await;
+
+    // 空
+    let res = router(&f)
+        .oneshot(authed_json(
+            "POST",
+            "/api/shares",
+            &token,
+            &batch_payload(&[], None, None),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST, "空批次应被拒");
+
+    // 重复项。去重后数量对不上就必须拒绝——否则界面显示 2 项、实际只有 1 项
+    let res = router(&f)
+        .oneshot(authed_json(
+            "POST",
+            "/api/shares",
+            &token,
+            &batch_payload(&[("file", file_id), ("file", file_id)], None, None),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST, "重复项应被拒");
+
+    // 超过上限
+    let over: Vec<(&str, i64)> = (0..crate::handlers::share::MAX_SHARE_ITEMS + 1)
+        .map(|i| ("file", i as i64 + 1))
+        .collect();
+    let res = router(&f)
+        .oneshot(authed_json(
+            "POST",
+            "/api/shares",
+            &token,
+            &batch_payload(&over, None, None),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST, "超上限应被拒");
+
+    f.cleanup().await;
+}
+
+// ---- 授权：下载 / 媒体 ----
+
+#[tokio::test]
+async fn batch_grants_access_inside_the_folder_subtree() {
+    let f = fixture("batch_subtree_ok").await;
+    let (uid, token) = add_user(&f, "sub_owner").await;
+    let t = build_tree(&f, uid).await;
+    let share_id = make_batch(&f, &token, &[("folder", t.a)], None, None).await;
+
+    // 直接列在批次里的文件夹，本身可浏览
+    let res = public_get(&f, &format!("/api/public/shares/{}/items?folder_id={}", share_id, t.a)).await;
+    assert_eq!(res.status(), StatusCode::OK, "批次内的文件夹应可进入");
+    let body = json_body(res).await;
+    assert_eq!(body["data"]["folder_id"], t.a);
+    let names: Vec<&str> = body["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"a1.jpg") && names.contains(&"精修"), "实际: {names:?}");
+
+    // 更深一层：a1 的文件下载
+    let res = public_get(&f, &format!("/api/public/shares/{}/download?file_id={}", share_id, t.a1)).await;
+    assert_eq!(res.status(), StatusCode::OK, "批次文件夹里的文件应可下载");
+
+    // 子文件夹可进入，里面的文件也可下载（任意深度）
+    let res = public_get(&f, &format!("/api/public/shares/{}/items?folder_id={}", share_id, t.b)).await;
+    assert_eq!(res.status(), StatusCode::OK, "子文件夹应可进入");
+    let res = public_get(&f, &format!("/api/public/shares/{}/download?file_id={}", share_id, t.b1)).await;
+    assert_eq!(res.status(), StatusCode::OK, "两层深的文件应可下载");
+
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn batch_denies_access_outside_the_folder_subtree() {
+    let f = fixture("batch_subtree_deny").await;
+    let (uid, token) = add_user(&f, "deny_owner").await;
+    let t = build_tree(&f, uid).await;
+    let share_id = make_batch(&f, &token, &[("folder", t.a)], None, None).await;
+
+    // ① 批次**外面**的目录不能进（A 的兄弟）
+    let res = public_get(&f, &format!("/api/public/shares/{}/items?folder_id={}", share_id, t.x)).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND, "批次外的目录不该能进");
+
+    // ② 批次外的目录里的文件不能下
+    let res = public_get(&f, &format!("/api/public/shares/{}/download?file_id={}", share_id, t.x1)).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND, "批次外的文件不该能下");
+
+    // ③ **祖先**目录也不能进。批次里放的是 A，A 的父目录不是授权范围，
+    //    否则「分享一个子目录」就等于「分享整个账号」。
+    let res = public_get(&f, &format!("/api/public/shares/{}/items?folder_id={}", share_id, t.ancestor)).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND, "祖先目录不该能进");
+
+    // ④ 批次外的文件即便确实属于分享者，也不能借道 /media 拿到
+    let res = public_get(&f, &format!("/api/public/shares/{}/media?file_id={}", share_id, t.x1)).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND, "批次外的文件不该能取媒体");
+
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn batch_denies_another_users_file_id() {
+    let f = fixture("batch_cross_file").await;
+    let (uid, token) = add_user(&f, "cross_owner").await;
+    let (other, _) = add_user(&f, "cross_other").await;
+    let (mine, _) = add_file(&f, uid, "mine.jpg", b"x").await;
+    let (theirs, _) = add_file(&f, other, "theirs.jpg", b"secret").await;
+
+    let share_id = make_batch(&f, &token, &[("file", mine)], None, None).await;
+
+    // 换成别人的 file_id —— 这是最容易写漏的一条
+    let res = public_get(&f, &format!("/api/public/shares/{}/download?file_id={}", share_id, theirs)).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND, "他人文件必须被拒");
+    let res = public_get(&f, &format!("/api/public/shares/{}/media?file_id={}", share_id, theirs)).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND, "他人文件必须被拒");
+
+    f.cleanup().await;
+}
+
+/// 缺少 `file_id` 参数时必须明确报错，而不是回落到「批次里唯一的那个文件」——
+/// 那是旧模型的残留行为，在批次下意味着「随便拿一个」。
+#[tokio::test]
+async fn public_download_requires_an_explicit_file_id() {
+    let f = fixture("batch_need_file_id").await;
+    let (uid, token) = add_user(&f, "needid").await;
+    let (file_id, _) = add_file(&f, uid, "only.jpg", b"x").await;
+    let share_id = make_batch(&f, &token, &[("file", file_id)], None, None).await;
+
+    let res = public_get(&f, &format!("/api/public/shares/{}/download", share_id)).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let res = public_get(&f, &format!("/api/public/shares/{}/media", share_id)).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    f.cleanup().await;
+}
+
+/// 面包屑只能从**批次根**开始，不能把批次之外的祖先目录名露给客户。
+#[tokio::test]
+async fn public_breadcrumbs_do_not_leak_ancestors_outside_the_batch() {
+    let f = fixture("batch_crumbs").await;
+    let (uid, token) = add_user(&f, "crumb_owner").await;
+    let t = build_tree(&f, uid).await;
+    let share_id = make_batch(&f, &token, &[("folder", t.a)], None, None).await;
+
+    let res = public_get(&f, &format!("/api/public/shares/{}/items?folder_id={}", share_id, t.b)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = json_body(res).await;
+
+    let crumbs: Vec<String> = body["data"]["breadcrumbs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap().to_string())
+        .collect();
+
+    assert_eq!(crumbs, vec!["婚礼", "精修"], "面包屑应从批次根开始：{crumbs:?}");
+    assert!(
+        !crumbs.contains(&"祖先".to_string()),
+        "批次之外的祖先目录名不该出现：{crumbs:?}"
+    );
+
+    f.cleanup().await;
+}
+
+// ---- 密码保护在批次下的行为 ----
+
+#[tokio::test]
+async fn password_protected_batch_blocks_browse_download_and_media() {
+    let f = fixture("batch_pwd_guard").await;
+    let (uid, token) = add_user(&f, "pwd_batch").await;
+    let t = build_tree(&f, uid).await;
+    let share_id = make_batch(&f, &token, &[("folder", t.a)], Some("letmein"), None).await;
+
+    // 不带票：浏览目录结构都不行（否则不输密码就能遍历出有哪些文件夹）
+    let res = public_get(&f, &format!("/api/public/shares/{}/items", share_id)).await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "未验码不该能浏览");
+    let res = public_get(&f, &format!("/api/public/shares/{}/items?folder_id={}", share_id, t.a)).await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "未验码不该能进目录");
+    let res = public_get(&f, &format!("/api/public/shares/{}/download?file_id={}", share_id, t.a1)).await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "未验码不该能下载");
+    let res = public_get(&f, &format!("/api/public/shares/{}/media?file_id={}", share_id, t.a1)).await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "未验码不该能取媒体");
+
+    // 验码之后全部放行
+    let res = router(&f)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/public/shares/{}/verify", share_id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"password":"letmein"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let ticket = json_body(res).await["data"]["ticket"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let res = public_get(
+        &f,
+        &format!("/api/public/shares/{}/items?folder_id={}&ticket={}", share_id, t.a, ticket),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK, "验码后应能浏览");
+    let res = public_get(
+        &f,
+        &format!("/api/public/shares/{}/download?file_id={}&ticket={}", share_id, t.a1, ticket),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK, "验码后应能下载");
+
+    f.cleanup().await;
+}
+
+// ---- 额度与失效 ----
+
+#[tokio::test]
+async fn batch_download_quota_is_charged_per_file() {
+    let f = fixture("batch_quota").await;
+    let (uid, token) = add_user(&f, "quota_batch").await;
+    let (f1, _) = add_file(&f, uid, "one.jpg", b"1111").await;
+    let (f2, _) = add_file(&f, uid, "two.jpg", b"2222").await;
+    let share_id = make_batch(&f, &token, &[("file", f1), ("file", f2)], None, Some(2)).await;
+
+    // 两个文件、额度 2 → 都能下
+    for id in [f1, f2] {
+        let res = public_get(&f, &format!("/api/public/shares/{}/download?file_id={}", share_id, id)).await;
+        assert_eq!(res.status(), StatusCode::OK, "file {id} 应在额度内");
+    }
+
+    let (count,): (i64,) = sqlx::query_as("SELECT download_count FROM file_shares WHERE id = ?")
+        .bind(&share_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 2, "每下一个文件扣一次");
+
+    // 额度用尽
+    let res = public_get(&f, &format!("/api/public/shares/{}/download?file_id={}", share_id, f1)).await;
+    assert_eq!(res.status(), StatusCode::GONE, "额度用尽后应拒绝");
+
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn deleted_items_disappear_from_the_public_view() {
+    let f = fixture("batch_deleted").await;
+    let (uid, token) = add_user(&f, "del_owner").await;
+    let (keep, _) = add_file(&f, uid, "keep.jpg", b"x").await;
+    let (gone, _) = add_file(&f, uid, "gone.jpg", b"x").await;
+    let share_id = make_batch(&f, &token, &[("file", keep), ("file", gone)], None, None).await;
+
+    sqlx::query("UPDATE files SET deleted_at = datetime('now') WHERE id = ?")
+        .bind(gone)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+    // 公开侧：已删的条目直接消失（客户不该看到「(已删除)」这种幽灵行）
+    let body = json_body(public_get(&f, &format!("/api/public/shares/{}", share_id)).await).await;
+    assert_eq!(body["data"]["item_count"], 1, "已删条目应从公开视图消失：{body}");
+
+    // 所有者侧：保留占位，让他知道这批东西坏了
+    let body = json_body(
+        router(&f)
+            .oneshot(authed_get(&format!("/api/shares/{}", share_id), &token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["data"]["item_count"], 2, "所有者应看到占位：{body}");
+    assert_eq!(body["data"]["items"][1]["name"], "(已删除)");
+
+    // 已删条目不可下载
+    let res = public_get(&f, &format!("/api/public/shares/{}/download?file_id={}", share_id, gone)).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn deleting_a_batch_removes_its_items() {
+    let f = fixture("batch_delete_cascade").await;
+    let (uid, token) = add_user(&f, "cascade").await;
+    let (file_id, _) = add_file(&f, uid, "a.jpg", b"x").await;
+    let t = build_tree(&f, uid).await;
+    let share_id = make_batch(&f, &token, &[("file", file_id), ("folder", t.a)], None, None).await;
+
+    let (before,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM share_items WHERE share_id = ?")
+            .bind(&share_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(before, 2);
+
+    let res = router(&f)
+        .oneshot(authed_json(
+            "DELETE",
+            &format!("/api/shares/{}", share_id),
+            &token,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let (after,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM share_items WHERE share_id = ?")
+        .bind(&share_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(after, 0, "删批次应连带清掉条目（外键 CASCADE）");
+
+    f.cleanup().await;
+}
+
+/// `batch/unshare` 在批次模型下的语义：停用**包含这些项的整个批次**。
+#[tokio::test]
+async fn batch_unshare_deactivates_whole_batches() {
+    let f = fixture("batch_unshare_semantics").await;
+    let (uid, token) = add_user(&f, "unshare_b").await;
+    let (file_id, _) = add_file(&f, uid, "a.jpg", b"x").await;
+
+    let share_id = make_batch(&f, &token, &[("file", file_id)], None, None).await;
+
+    let res = router(&f)
+        .oneshot(authed_json(
+            "POST",
+            "/api/batch/unshare",
+            &token,
+            &format!(r#"{{"items":[{{"type":"file","id":{}}}]}}"#, file_id),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = json_body(res).await;
+    assert_eq!(body["data"]["unshared"], 1, "{body}");
+    assert_eq!(body["data"]["results"][0]["status"], "unshared");
+    assert_eq!(
+        body["data"]["results"][0]["share_ids"][0].as_str().unwrap(),
+        share_id
+    );
+
+    // 分享应已失效
+    let res = public_get(&f, &format!("/api/public/shares/{}", share_id)).await;
+    assert_eq!(res.status(), StatusCode::GONE, "批次应已失效");
+
+    f.cleanup().await;
+}
+
+/// 批次里的文件夹递归计数要对，且不受已删内容影响。
+#[tokio::test]
+async fn batch_stats_are_recursive_and_ignore_trashed_content() {
+    let f = fixture("batch_stats").await;
+    let (uid, token) = add_user(&f, "stats_owner").await;
+    let t = build_tree(&f, uid).await;
+    let share_id = make_batch(&f, &token, &[("folder", t.a)], None, None).await;
+
+    let body = json_body(public_get(&f, &format!("/api/public/shares/{}", share_id)).await).await;
+    // A 下有 a1，B 下有 b1 → 2 个文件；文件夹是 A 和 B → 2 个
+    assert_eq!(body["data"]["total_file_count"], 2, "{body}");
+    assert_eq!(body["data"]["total_folder_count"], 2, "{body}");
+
+    // 把 b1 删掉之后再算，应当少一个文件
+    sqlx::query("UPDATE files SET deleted_at = datetime('now') WHERE id = ?")
+        .bind(t.b1)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let body = json_body(public_get(&f, &format!("/api/public/shares/{}", share_id)).await).await;
+    assert_eq!(
+        body["data"]["total_file_count"], 1,
+        "已进回收站的文件不该计入交付内容：{body}"
+    );
+
+    f.cleanup().await;
 }

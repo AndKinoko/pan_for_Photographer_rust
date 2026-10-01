@@ -1,6 +1,6 @@
 <script setup>
 import { computed, watch, ref, onMounted, onBeforeUnmount } from 'vue'
-import { authUrl, fileIcon, formatSize, formatDate, isImageFile } from '../api'
+import { authUrl, fileIcon, formatSize, formatDate, isImageFile, withShareTicket } from '../api'
 import { useTransfer } from '../composables/useTransfer'
 import AppIcon from './AppIcon.vue'
 import { useModal } from '../composables/useModal'
@@ -13,7 +13,25 @@ const props = defineProps({
   files: { type: Array, default: () => [] },
   /** Current index within files. */
   index: { type: Number, default: 0 },
+  /**
+   * `'auth'` —— 登录态（默认）。媒体地址走 authUrl，下载带 JWT。
+   * `'share'` —— 公开分享页。媒体地址补分享票据，下载不带任何登录凭据。
+   *
+   * 两种模式的凭证处理完全不同，收在这里而不是让调用方各传一套 URL ——
+   * 否则「下载按钮用了登录态地址」这种错误只会在客户点下载时才暴露。
+   */
+  mode: { type: String, default: 'auth' },
+  /** mode 为 share 时的访问票据（无密码分享传空串即可） */
+  ticket: { type: String, default: '' },
 })
+
+const isShareMode = computed(() => props.mode === 'share')
+
+/** 统一处理媒体地址的凭证。 */
+function mediaUrl(url) {
+  if (!url) return url
+  return isShareMode.value ? withShareTicket(url, props.ticket) : authUrl(url)
+}
 
 const emit = defineEmits(['close', 'update:index'])
 
@@ -51,7 +69,7 @@ const mediaSrc = computed(() => {
     isGif.value && (current.value.size || 0) <= GIF_MAX_BYTES
       ? current.value.media_url
       : current.value.preview_url || current.value.media_url
-  return authUrl(url)
+  return mediaUrl(url)
 })
 
 function downloadCurrent() {
@@ -59,8 +77,11 @@ function downloadCurrent() {
   // 下载进入全局下载队列（抽屉内实时进度）
   transfer.enqueueDownload({
     filename: current.value.name,
-    url: current.value.download_url,
-    authed: true,
+    // 公开分享页没有登录态，凭据走分享票据；登录态则走 Authorization 头。
+    url: isShareMode.value
+      ? withShareTicket(current.value.download_url, props.ticket)
+      : current.value.download_url,
+    authed: !isShareMode.value,
   })
 }
 

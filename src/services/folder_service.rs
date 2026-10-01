@@ -158,11 +158,18 @@ pub async fn soft_delete_folder(
     for fid in &folder_ids {
         // owner_id 是纵深防御：folder_ids 来自本用户的文件夹树，理论上已是自己的，
         // 但 SQL 自身不带归属约束时，一旦上游判定出缺口就会连带删掉别人的文件。
-        sqlx::query("UPDATE files SET deleted_at = datetime('now') WHERE folder_id = ? AND owner_id = ? AND deleted_at IS NULL")
-            .bind(fid)
-            .bind(owner_id)
-            .execute(&mut *tx)
-            .await?;
+        //
+        // `deleted_with_folder_id` 记下「这个文件是跟着文件夹一起进来的」，
+        // 供恢复与永久删除区分它与「用户单独删的」文件。详见 db.rs 的迁移注释。
+        sqlx::query(
+            "UPDATE files SET deleted_at = datetime('now'), deleted_with_folder_id = ?
+             WHERE folder_id = ? AND owner_id = ? AND deleted_at IS NULL",
+        )
+        .bind(fid)
+        .bind(fid)
+        .bind(owner_id)
+        .execute(&mut *tx)
+        .await?;
     }
 
     // 软删除所有收集到的文件夹
@@ -241,12 +248,21 @@ pub async fn restore_folder(
     }
 
     // 恢复所有文件夹中的文件
+    //
+    // **只复活跟着文件夹一起进回收站的那些**（`deleted_with_folder_id` 非空）。
+    // 原先的条件只有 `folder_id = ? AND owner_id = ?`，于是用户此前单独删掉的
+    // 文件也会被一起复活——他看到的是一批「我从没要求恢复」的文件凭空出现，
+    // 而且这些文件在回收站列表里本来是独立一项，用户在界面上根本没把它们
+    // 和这个文件夹联系起来。
     for fid in &folder_ids {
-        sqlx::query("UPDATE files SET deleted_at = NULL WHERE folder_id = ? AND owner_id = ?")
-            .bind(fid)
-            .bind(owner_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE files SET deleted_at = NULL, deleted_with_folder_id = NULL
+             WHERE folder_id = ? AND owner_id = ? AND deleted_with_folder_id IS NOT NULL",
+        )
+        .bind(fid)
+        .bind(owner_id)
+        .execute(&mut *tx)
+        .await?;
     }
 
     // 如果父文件夹被删除了，将文件夹移到根目录
@@ -359,12 +375,25 @@ pub async fn permanently_delete_folder(
     let mut tx = pool.begin().await?;
 
     // 删除所有文件夹中的文件记录（物理文件交由 GC 处理）
+    //
+    // **不碰用户单独删除的文件。** 原先这里是裸的 `WHERE folder_id = ?`，
+    // 会把用户此前单独移入回收站的文件一并硬删 —— 那些文件本该还能从回收站
+    // 单独恢复，用户从没对它们执行过「永久删除」。留着它们的行即可：
+    // 随后 folder 行被删除时 `ON DELETE SET NULL` 会把它们的 folder_id 清空，
+    // 于是它们安静地留在回收站根目录，仍是可恢复的。
+    //
+    // 要被删掉的是另外两类：跟着本文件夹一起进来的（deleted_with_folder_id 非空），
+    // 以及还活着的（deleted_at IS NULL）——文件夹都没了，活文件无处安放。
     for fid in &folder_ids {
-        sqlx::query("DELETE FROM files WHERE folder_id = ? AND owner_id = ?")
-            .bind(fid)
-            .bind(owner_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "DELETE FROM files
+             WHERE folder_id = ? AND owner_id = ?
+               AND (deleted_at IS NULL OR deleted_with_folder_id IS NOT NULL)",
+        )
+        .bind(fid)
+        .bind(owner_id)
+        .execute(&mut *tx)
+        .await?;
     }
 
     // 删除文件夹记录

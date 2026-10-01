@@ -143,36 +143,71 @@ fn build_router(state: AppState) -> Router<()> {
 
     let static_dir = state.config.static_dir.clone();
 
-    // 静态文件服务，添加无缓存响应头
+    // SPA 回退。挂在 `ServeDir` 的 `fallback` 上，于是优先级是
+    // 「静态资源 → 回退」，`/assets/*.js`、`favicon.svg` 等照常命中。
+    //
+    // 用的是 `fallback` 而**不是** `not_found_service`：后者内部是
+    // `fallback(SetStatus::new(svc, 404))`，会把回退响应的状态码强行改写成 404。
+    // SPA 回退必须返回 200 —— 浏览器拿到 404 仍会渲染 HTML，但前端代码、
+    // 监控告警、CDN 缓存规则都会把它当成「页面不存在」，这类误报很难查。
+    // `fallback` 保留内层服务自己的状态码。
+    //
+    // 为什么不能再只给 `/share/*` 挂回退：`/admin`、`/search`、`/trash`、`/shares`
+    // 直接访问或刷新会 404。单页内导航看不出来，但「把 /admin 收藏了再点开」
+    // 是很自然的动作，公网上这就是一句「你给的链接打不开」。
+    //
+    // 唯一需要区分的是 `/api/`：未匹配的接口路径必须继续返回 JSON 404，
+    // 而不是 index.html —— 否则前端把端点名拼错时会拿到一坨 HTML，
+    // axios 解析失败后报出的错误与真实原因毫无关系。
+    let spa_fallback = {
+        let sd = static_dir.clone();
+        move |req: Request<Body>| {
+            let sd = sd.clone();
+            async move {
+                use axum::response::IntoResponse;
+                if req.uri().path().starts_with("/api/") {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        axum::Json(serde_json::json!({
+                            "success": false,
+                            "data": null,
+                            "error": "接口不存在"
+                        })),
+                    )
+                        .into_response();
+                }
+                match tokio::fs::File::open(std::path::Path::new(&sd).join("index.html")).await {
+                    Ok(file) => {
+                        let stream = ReaderStream::new(file);
+                        let body = Body::from_stream(stream);
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "text/html; charset=utf-8")
+                            .header("cache-control", "no-cache, no-store, must-revalidate")
+                            .header("pragma", "no-cache")
+                            .header("expires", "0")
+                            .body(body)
+                            .unwrap_or_else(|_| {
+                                (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "Internal Server Error",
+                                )
+                                    .into_response()
+                            })
+                    }
+                    Err(_) => (StatusCode::NOT_FOUND, "Not Found").into_response(),
+                }
+            }
+        }
+    };
+
+    // 静态文件服务：`ServeDir` 找不到的文件交给上面的 SPA 回退。
     let static_service = ServiceBuilder::new()
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
             header::HeaderValue::from_static("no-cache, no-store, must-revalidate"),
         ))
-        .service(ServeDir::new(&static_dir));
-
-    // SPA 回退：对非 API 路由返回 index.html
-    let spa_fallback = {
-        let sd = static_dir.clone();
-        async move |_req: Request<Body>| -> Response<Body> {
-            use axum::response::IntoResponse;
-            match tokio::fs::File::open(std::path::Path::new(&sd).join("index.html")).await {
-            Ok(file) => {
-                let stream = ReaderStream::new(file);
-                let body = Body::from_stream(stream);
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "text/html; charset=utf-8")
-                    .header("cache-control", "no-cache, no-store, must-revalidate")
-                    .header("pragma", "no-cache")
-                    .header("expires", "0")
-                    .body(body)
-                    .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response())
-            }
-            Err(_) => (StatusCode::NOT_FOUND, "Not Found").into_response(),
-        }
-        }
-    };
+        .service(ServeDir::new(&static_dir).fallback(axum::routing::get(spa_fallback)));
 
     // 在一个 Router 中构建所有路由，避免合并带来的路由问题
     Router::new()
@@ -181,6 +216,9 @@ fn build_router(state: AppState) -> Router<()> {
         .route("/api/auth/invite/verify", post(handlers::auth::verify_invite))
         .route("/api/auth/login", post(handlers::auth::login))
         .route("/api/auth/me", get(handlers::auth::me))
+        // 媒体访问凭证。缩略图 / 预览图 / 下载链接不能带 Authorization 头，
+        // 只能把凭据放进查询串；签发一枚窄口径、短时效的票据来替代 JWT。
+        .route("/api/auth/media-ticket", post(handlers::auth::media_ticket))
         // 文件路由
         .route("/api/files", get(handlers::files::list_files))
         // 仅上传路由放开大数据量请求体上限；其余接口保持 axum 默认较小限制，缩小 DoS 面
@@ -214,11 +252,14 @@ fn build_router(state: AppState) -> Router<()> {
         .route("/api/batch/move", post(handlers::batch::batch_move))
         .route("/api/batch/copy", post(handlers::batch::batch_copy))
         .route("/api/batch/delete", post(handlers::batch::batch_delete))
-        .route("/api/batch/share", post(handlers::batch::batch_share))
+        // 没有 `/api/batch/share`：批次模型下「分享选中的这批东西」就是
+        // `POST /api/shares`（body 收 `items`），两个端点会完全同义。
         .route("/api/batch/unshare", post(handlers::batch::batch_unshare))
         // 公开分享路由
         .route("/api/public/shares/:id", get(handlers::share::public_share_access))
         .route("/api/public/shares/:id/verify", post(handlers::share::public_verify_password))
+        // 浏览批次内容（根 = 批次里直接包含的条目；带 folder_id = 进入子目录）
+        .route("/api/public/shares/:id/items", get(handlers::share::public_share_items))
         .route("/api/public/shares/:id/download", get(handlers::share::public_share_download))
         .route("/api/public/shares/:id/media", get(handlers::share::public_share_media))
         // 搜索路由
@@ -258,12 +299,31 @@ fn build_router(state: AppState) -> Router<()> {
                 }))
             }),
         )
-        // SPA：为分享路由及其他 SPA 路径提供 index.html
-        .route("/share/*rest", get(spa_fallback))
-        // 静态文件及 SPA 回退
+        // SPA 回退由 fallback_service 内部处理（ServeDir 找不到就交给 index.html），
+        // 不再为 `/share/*` 单独开一条路由。
         .fallback_service(static_service)
         .layer(TraceLayer::new_for_http().make_span_with(default_make_span))
         .layer(cors)
+        // 全站安全响应头。放在最外层，静态资源、SPA 回退与 API 响应一并生效。
+        //
+        // · no-referrer：本页一旦真的跳出到站外，不要把当前 URL 带过去。
+        //   缩略图/下载链接的查询串里带着媒体票据，从 Referer 漏出去是最没有
+        //   技术含量的一种泄漏方式。
+        // · SAMEORIGIN：站内用 <iframe> 展示 PDF，同源放行不受影响；
+        //   同时挡住被外站嵌框做点击劫持。
+        // · nosniff：媒体接口已单独加过，这里补上其余响应。
+        .layer(SetResponseHeaderLayer::overriding(
+            header::REFERRER_POLICY,
+            header::HeaderValue::from_static("no-referrer"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_FRAME_OPTIONS,
+            header::HeaderValue::from_static("SAMEORIGIN"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_CONTENT_TYPE_OPTIONS,
+            header::HeaderValue::from_static("nosniff"),
+        ))
         .with_state(state)
 }
 
