@@ -225,4 +225,4 @@ cd frontend && npm run dev    # Vite 开发服务器，/api 自动代理到 loca
 
 ## 许可证
 
-私有项目，还没加 LICENSE 文件。如果要开源或分发，请先补一个（MIT / Apache-2.0 等）。
+MIT
